@@ -1,0 +1,49 @@
+{
+  "exchanges": {
+    "binance": {
+      "api_key": "",
+      "api_secret": "",
+      "testnet": true,
+      "enabled": false
+    },
+    "okx": {
+      "api_key": "1dcf40d7-e2d7-4470-a9d6-b55806425dc5",
+      "api_secret": "BOSS_WILL_PROVIDE_LATER",
+      "passphrase": "BOSS_WILL_PROVIDE_LATER",
+      "testnet": false,
+      "enabled": true
+    },
+    "bybit": {
+      "api_key": "",
+      "api_secret": "",
+      "testnet": true,
+      "enabled": false
+    }
+  },
+  "risk_management": {
+    "max_position_risk": 0.02,
+    "max_daily_loss": 0.05,
+    "max_drawdown": 0.15,
+    "leverage_limit": 5
+  },
+  "default_strategy_params": {
+    "ema_cross": {
+      "fast_period": 12,
+      "slow_period": 26,
+      "timeframe": "4h",
+      "risk_percent": 0.01
+    },
+    "rsi_mean_reversion": {
+      "rsi_period": 14,
+      "oversold": 30,
+      "overbought": 70,
+      "timeframe": "1h"
+    }
+  },
+  "notifications": {
+    "telegram_bot_token": "",
+    "telegram_chat_id": "",
+    "signal_alerts": true,
+    "risk_alerts": true
+  }
+}

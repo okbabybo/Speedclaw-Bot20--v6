@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "skills": {
+    "tavily-search": {
+      "version": "1.0.0",
+      "installedAt": 1772179629340
+    },
+    "summarize": {
+      "version": "1.0.0",
+      "installedAt": 1772179651934
+    },
+    "agent-browser": {
+      "version": "0.2.0",
+      "installedAt": 1772179669274
+    },
+    "find-skills": {
+      "version": "0.1.0",
+      "installedAt": 1772179684028
+    },
+    "github": {
+      "version": "1.0.0",
+      "installedAt": 1772179706161
+    },
+    "obsidian": {
+      "version": "1.0.0",
+      "installedAt": 1772179728789
+    },
+    "notion": {
+      "version": "1.0.0",
+      "installedAt": 1772179754667
+    },
+    "weather": {
+      "version": "1.0.0",
+      "installedAt": 1772179823440
+    },
+    "tencentcloud-lighthouse-skill": {
+      "version": "1.0.0",
+      "installedAt": 1772179839761
+    },
+    "agency-agents": {
+      "version": "1.0.2",
+      "installedAt": 1774225129975
+    },
+    "autoresearch": {
+      "version": "1.0.2",
+      "installedAt": 1774269244799
+    },
+    "agent-team-orchestration": {
+      "version": "1.0.0",
+      "installedAt": 1774269306372
+    },
+    "skill-creator": {
+      "version": "0.1.0",
+      "installedAt": 1774269363938
+    },
+    "claude-code-teams": {
+      "version": "1.0.0",
+      "installedAt": 1774270387998
+    },
+    "composio": {
+      "version": "1.0.0",
+      "installedAt": 1774335850003
+    }
+  }
+}

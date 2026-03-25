@@ -1,0 +1,16 @@
+{
+  "exchange": "okx",
+  "apiKey": "1dcf40d7-e2d7-4470-a9d6-b55806425dc5",
+  "secret": "48BD3C6DD83E7929015BD0203803E074",
+  "passphrase": "Fjh872330@",
+  "sandbox": false,
+  "options": {
+    "defaultType": "swap",
+    "adjustForTimeDifference": true,
+    "createMarketBuyOrderRequiresPrice": false
+  },
+  "telegram": {
+    "bot_token": "8695124134:AAEf8hAHWuCDCy4HY-y4XHM7qoJ6bGvZctw",
+    "chat_id": "6220318210"
+  }
+}

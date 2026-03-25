@@ -1,0 +1,28 @@
+{
+  "exchange": "okx",
+  "apiKey": "1dcf40d7-e2d7-4470-a9d6-b55806425dc5",
+  "apiSecret": "48BD3C6DD83E7929015BD0203803E074",
+  "passphrase": "Fjh872330@",
+  "sandbox": false,
+  "options": {
+    "defaultType": "swap",
+    "adjustForTimeDifference": true
+  },
+  "symbols": ["BTC/USDT:USDT", "ETH/USDT:USDT"],
+  "timeframe": "5m",
+  "risk": {
+    "maxPositionSize": 0.03,
+    "stopLossPct": 0.015,
+    "takeProfitRatio": 2
+  },
+  "skills": {
+    "tavily_search": true,
+    "find_skills": true,
+    "summarize": true,
+    "self_improving": true,
+    "gog": true,
+    "crypto_agent_trading": true,
+    "crypto_trading_bots": true,
+    "openmm_grid_trading": true
+  }
+}
