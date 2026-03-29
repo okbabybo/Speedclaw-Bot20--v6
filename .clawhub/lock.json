@@ -60,6 +60,14 @@
     "composio": {
       "version": "1.0.0",
       "installedAt": 1774335850003
+    },
+    "mcp-lark": {
+      "version": "1.0.0",
+      "installedAt": 1774802587592
+    },
+    "mty-frontend-design-zh": {
+      "version": "1.0.0",
+      "installedAt": 1774802599878
     }
   }
 }
