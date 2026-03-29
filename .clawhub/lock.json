@@ -68,6 +68,22 @@
     "mty-frontend-design-zh": {
       "version": "1.0.0",
       "installedAt": 1774802599878
+    },
+    "deep-thinking": {
+      "version": "1.0.0",
+      "installedAt": 1774803974901
+    },
+    "adaptive-reasoning": {
+      "version": "1.0.0",
+      "installedAt": 1774803977415
+    },
+    "xiucheng-self-improving-agent": {
+      "version": "1.0.0",
+      "installedAt": 1774803979149
+    },
+    "reasoning-personas": {
+      "version": "1.0.0",
+      "installedAt": 1774803985269
     }
   }
 }
