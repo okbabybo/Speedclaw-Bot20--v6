@@ -210,3 +210,22 @@ The goal: Be helpful without being annoying. Check in a few times a day, do usef
 ## Make It Yours
 
 This is a starting point. Add your own conventions, style, and rules as you figure out what works.
+
+## 强制记忆流程（2026-04-07 新增）
+
+**每次启动必须执行：**
+1. 读取 SOUL.md
+2. 读取 USER.md
+3. 读取 MEMORY.md
+4. 读取 memory/YYYY-MM-DD.md（今天+昨天）
+5. ✅ 主动调用 memory_search 查询相关历史
+
+**交易操作强制记录：**
+- 每次下单前记录到 memory/YYYY-MM-DD.md
+- 每次平仓后记录盈亏
+- 每次亏损必须写教训总结
+
+**Self-Improving Agent：**
+- 已启用 self-improving-agent
+- 自动分析对话质量
+- 每周生成改进报告

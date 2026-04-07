@@ -1,0 +1,31 @@
+---
+app:
+  # "postgres" or "sqlite"
+  driver: "sqlite"
+
+  # Postgres configuration (if driver is postgres)
+  postgres:
+    host: "127.0.0.1"
+    port: 5432
+    database: "jesse"
+    username: "postgres"
+    password: "postgres"
+
+  # SQLite config (if driver is sqlite)
+  sqlite:
+    database: "storage/database.sqlite"
+
+  # Candles database path (where candle data is stored)
+  candles: "storage/candles"
+
+  # if you want to use multiple candles databases at the same time
+  candles_path: []
+
+  # used in the backtesting and hyperparameter optimization modes
+  # to define how many candles to load per round. Leave it on 0 to load
+  # all available candles. You might want to load more candles if you have
+  # indicators that need large lookback window.
+  candles_load_limit: 0
+
+exchange: "OKX"
+"""

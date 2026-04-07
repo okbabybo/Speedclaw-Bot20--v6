@@ -1,0 +1,32 @@
+{
+    "max_open_trades": 1,
+    "stake_currency": "USDT",
+    "stake_amount": 5,
+    "dry_run": false,
+    "trading_mode": "futures",
+    "margin_mode": "cross",
+    "unfilledtimeout": {"entry": 10, "exit": 10, "unit": "minutes"},
+    "exit_only_on_signal": true,
+    "entry_pricing": {
+        "price_side": "same",
+        "use_order_book": true,
+        "order_book_top": 1
+    },
+    "exit_pricing": {
+        "price_side": "same",
+        "use_order_book": true,
+        "order_book_top": 1
+    },
+    "exchange": {
+        "name": "okx",
+        "key": "be046210-77bd-47e6-8524-dee2f2acebd9",
+        "secret": "508989F295B579CA787D85F500B9C02E",
+        "password": "Fjh872330@",
+        "ccxt_config": {"options": {"defaultType": "swap"}},
+        "ccxt_async_config": {},
+        "pair_whitelist": ["ETH/USDT:USDT"]
+    },
+    "pairlists": [
+        {"method": "StaticPairList", "allow_inactive": false}
+    ]
+}

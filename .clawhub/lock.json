@@ -84,6 +84,14 @@
     "reasoning-personas": {
       "version": "1.0.0",
       "installedAt": 1774803985269
+    },
+    "clawgate": {
+      "version": "0.1.2",
+      "installedAt": 1775211404263
+    },
+    "market-analysis-cn": {
+      "version": "1.0.0",
+      "installedAt": 1775348795158
     }
   }
 }

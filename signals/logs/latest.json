@@ -1,0 +1,59 @@
+[
+  {
+    "inst_id": "BTC-USDT-SWAP",
+    "name": "BTC",
+    "timestamp": "2026-04-04 16:14",
+    "last": 66967.9,
+    "mark": 66967.9,
+    "basis": 0.0583,
+    "funding_pct": -0.0,
+    "oi_usd": 20.3,
+    "rsi_14": 74.8,
+    "ema7": 67781.32,
+    "ema21": 67176.81,
+    "atr": 612.68,
+    "vol_ratio": 0.39,
+    "direction": "SHORT",
+    "confidence": 60,
+    "entry": 66967.9,
+    "stop": 67886.92,
+    "tp1": 65129.86,
+    "tp2": 63904.51,
+    "signals": [
+      "EMA死叉",
+      "RSI超买",
+      "RSI偏高压力",
+      "高位地量"
+    ],
+    "long_score": 35,
+    "short_score": 60
+  },
+  {
+    "inst_id": "ETH-USDT-SWAP",
+    "name": "ETH",
+    "timestamp": "2026-04-04 16:14",
+    "last": 2052.89,
+    "mark": 2052.89,
+    "basis": -0.0029,
+    "funding_pct": 0.0061,
+    "oi_usd": 14.4,
+    "rsi_14": 84.9,
+    "ema7": 2121.56,
+    "ema21": 2084.81,
+    "atr": 26.86,
+    "vol_ratio": 0.63,
+    "direction": "SHORT",
+    "confidence": 50,
+    "entry": 2052.89,
+    "stop": 2093.17,
+    "tp1": 1972.32,
+    "tp2": 1918.61,
+    "signals": [
+      "EMA死叉",
+      "RSI超买",
+      "高位地量"
+    ],
+    "long_score": 35,
+    "short_score": 50
+  }
+]
