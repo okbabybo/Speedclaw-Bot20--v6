@@ -1,24 +1,30 @@
 """
-全自动交易系统 v2.0
-止损3% + 移动止盈（1.5%触发0.5%回调止盈 / 2%触发0.5%回调止盈 / 趋势单持有等0.5%回调止盈）
+全自动交易系统 v3.0
+- 多周期RSI + MA20 + 资金费率 + 24h高低点 实时判断
+- 所有信号条件基于实时行情，不写死数据
+- 止损3% / 移动止盈（实时跟踪）
 
-【核心规则 v2.0】
-1. 止损：3% 固定
-2. 止盈：
-   - 价格移动1.5% → 激活移动止盈，等回调0.5%止盈
-   - 价格移动2.0% → 激活移动止盈，等回调0.5%止盈
-   - 价格持续移动 → 持有，等从最优价格回调0.5%止盈
-3. 每单风险：1%-3%账户（按余额动态）
-4. 100x杠杆
-5. 日亏损3% → 停止所有交易
-6. 不持仓过夜（22:00前平仓）
-7. 【必须先报信号确认，不擅自下单】
+【信号条件】（全部基于实时数据动态判断）
 
-【止盈逻辑示意（做空@$72,000）】
-- 止损：$74,160（+3%）
-- 价格跌到$70,920（-1.5%）：激活止盈，等从$70,920反弹0.5%到$71,285→平仓
-- 价格继续跌到$70,560（-2.0%）：继续持有，等从$70,560反弹0.5%到$70,913→平仓
-- 价格一直跌到$68,000：持有，等从$68,000反弹0.5%到$68,340→平仓
+做空信号（需同时满足）：
+  1. 价格在4H MA20上方（偏弱不做多）
+  2. RSI 4H > 60 或 RSI 1H > 65（超买）
+  3. 资金费率 > 0.015%（多头拥挤）
+  4. 从24h低点反弹 > 4%（累积涨幅，注意回调风险）
+  5. 价格在合理做空区间（距离24h高点 < 3%）
+
+做多信号（需同时满足）：
+  1. 价格在4H MA20下方（偏强不做空）
+  2. RSI 4H < 40 或 RSI 1H < 35（超卖）
+  3. 资金费率 < -0.015%（空头拥挤）
+  4. 从24h高点回落 > 4%（注意抄底风险）
+  5. 价格在合理做多区间（距离24h低点 < 3%）
+
+止盈逻辑：
+  做空：价格移动1.5% → 激活移动止盈，等反弹0.5%平仓
+       价格移动2.0% → 继续持有，等反弹0.5%平仓
+       价格持续下跌 → 等从最低点反弹0.5%平仓
+  做多：同上反之
 """
 
 import requests
@@ -29,32 +35,34 @@ import base64
 import hashlib
 from datetime import datetime
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
-# ============ 账户配置 ============
-ACCOUNT = 996.82      # 动态获取
+# ============ 配置 ============
 LEVERAGE = 100
-SL_PCT = 0.03         # 3% 止损
-TP1_PCT = 0.015       # 1.5% 触发移动止盈
-TP2_PCT = 0.02        # 2% 触发移动止盈
-TRAILING_PCT = 0.005  # 0.5% 回调止盈
-DAILY_LOSS_LIMIT = 0.03  # 3% 日亏损上限
-TRADE_INTERVAL = 30   # 30秒
+SL_PCT = 0.03          # 3%止损
+TP1_PCT = 0.015        # 1.5%触发移动止盈
+TP2_PCT = 0.02         # 2%触发移动止盈
+TRAILING_PCT = 0.005   # 0.5%回调止盈
+DAILY_LOSS_LIMIT = 0.03  # 3%日亏损上限
+TRADE_INTERVAL = 30      # 30秒检查
 
-# 迷你测试仓：固定10张（风险约1%）
+# 信号阈值（动态参考）
+RSI_SHORT_4H = 60
+RSI_SHORT_1H = 65
+RSI_LONG_4H = 40
+RSI_LONG_1H = 35
+FR_THRESHOLD = 0.00015   # 0.015%
+REBOUND_THRESHOLD = 0.04  # 4%
+
+# 测试迷你仓
 TEST_CONTRACTS = 10
 
-# 信号区间
-SHORT_ZONE = (72000, 72500)
-LONG_ZONE = (69500, 70500)
-
-# ============ API配置 ============
+# ============ API ============
 API_KEY = "be046210-77bd-47e6-8524-dee2f2acebd9"
 SECRET_KEY = "508989F295B579CA787D85F500B9C02E"
 PASSPHRASE = "Fjh872330@"
 BASE_URL = "https://www.okx.com"
 
-# ============ 工具函数 ============
 def sign(msg: str, sk: str) -> str:
     return base64.b64encode(hmac.new(sk.encode(), msg.encode(), hashlib.sha256).digest()).decode()
 
@@ -70,60 +78,103 @@ def headers(path: str, method: str, body: str = '') -> dict:
     }
 
 def get(url: str) -> dict:
-    path = url.replace(BASE_URL, '')
-    resp = requests.get(url, headers=headers(path, 'GET'), timeout=10)
-    return resp.json()
+    p = url.replace(BASE_URL, '')
+    return requests.get(url, headers=headers(p, 'GET'), timeout=10).json()
 
 def post(url: str, body: dict) -> dict:
-    path = url.replace(BASE_URL, '')
-    data = json.dumps(body)
-    resp = requests.post(url, data=data, headers=headers(path, 'POST', data), timeout=10)
-    return resp.json()
+    p = url.replace(BASE_URL, '')
+    d = json.dumps(body)
+    return requests.post(url, data=d, headers=headers(p, 'POST', d), timeout=10).json()
 
-# ============ 数据模型 ============
-@dataclass
-class Position:
-    direction: str
-    entry_price: float
-    contracts: int
-    stop_loss: float       # 3% 固定止损
-    tp1_triggered: bool = False   # 1.5%触发
-    tp2_triggered: bool = False   # 2%触发
-    best_price: float = 0.0       # 做空=记录最低价，做多=记录最高价
-    trailing_active: bool = False  # 移动止盈已激活
-    trailing_exit: float = 0.0    # 移动止盈退出价
-    status: str = 'open'
-    order_id: str = ''
-    timestamp: str = field(default_factory=lambda: datetime.now().strftime('%H:%M:%S'))
+# ============ 数据获取 ============
+def get_candles(inst_id: str, bar: str, limit: int = 100) -> List[List[float]]:
+    """获取K线数据，返回[[open, high, low, close, volume], ...]"""
+    data = get(f'{BASE_URL}/api/v5/market/history-candles?instId={inst_id}&bar={bar}&limit={limit}')
+    result = []
+    for row in data.get('data', []):
+        try:
+            result.append([float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5])])
+        except:
+            pass
+    return result
 
-@dataclass
-class Signal:
-    direction: str
-    entry_price: float
-    stop_loss: float
-    contracts: int
-    risk_pct: float
-    reason: str
-    timestamp: str = field(default_factory=lambda: datetime.now().strftime('%H:%M:%S'))
+def calc_rsi(candles: List[List[float]], period: int = 14) -> float:
+    """计算RSI"""
+    if len(candles) < period + 1:
+        return 50.0
+    closes = [c[3] for c in candles]
+    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    gains = [d if d > 0 else 0 for d in deltas[-period:]]
+    losses = [-d if d < 0 else 0 for d in deltas[-period:]]
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    if avg_loss == 0:
+        return 100.0
+    return 100.0 - (100.0 / (1.0 + avg_gain / avg_loss))
 
-# ============ 市场数据 ============
+def calc_ma(candles: List[List[float]], period: int = 20) -> float:
+    """计算MA"""
+    closes = [c[3] for c in candles[-period:]]
+    return sum(closes) / period
+
 def get_market_data() -> dict:
+    """获取完整市场数据"""
     btc_t = get(f'{BASE_URL}/api/v5/market/ticker?instId=BTC-USDT-SWAP')['data'][0]
-    eth_t = get(f'{BASE_URL}/api/v5/market/ticker?instId=ETH-USDT-SWAP')['data'][0]
     btc_fr = get(f'{BASE_URL}/api/v5/public/funding-rate?instId=BTC-USDT-SWAP')['data'][0]
+
+    # K线
+    candles_4h = get_candles('BTC-USDT-SWAP', '4H', 100)
+    candles_1h = get_candles('BTC-USDT-SWAP', '1H', 100)
+    candles_30m = get_candles('BTC-USDT-SWAP', '30m', 100)
+
+    price = float(btc_t['last'])
+    high24 = float(btc_t['high24h'])
+    low24 = float(btc_t['low24h'])
+    fr = float(btc_fr['fundingRate'])
+
+    # RSI
+    rsi_4h = calc_rsi(candles_4h, 14)
+    rsi_1h = calc_rsi(candles_1h, 14)
+    rsi_30m = calc_rsi(candles_30m, 14)
+
+    # MA
+    ma20_4h = calc_ma(candles_4h, 20)
+    ma20_1h = calc_ma(candles_1h, 20)
+
+    # 动态区间（基于当前价格和24h范围）
+    mid_price = (high24 + low24) / 2
+    range_size = high24 - low24
+
+    # 做空区间：价格靠近24h高点的30%范围以内
+    short_zone_high = high24
+    short_zone_low = high24 - range_size * 0.30
+
+    # 做多区间：价格靠近24h低点的30%范围以内
+    long_zone_low = low24
+    long_zone_high = low24 + range_size * 0.30
+
+    # 从高低点变动
+    from_low_pct = (price - low24) / low24 * 100
+    from_high_pct = (high24 - price) / high24 * 100
+
     return {
-        'btc': {
-            'last': float(btc_t['last']),
-            'high24h': float(btc_t['high24h']),
-            'low24h': float(btc_t['low24h']),
-            'open24h': float(btc_t['open24h']),
-            'funding_rate': float(btc_fr['fundingRate']),
-        },
-        'eth': {
-            'last': float(eth_t['last']),
-            'high24h': float(eth_t['high24h']),
-            'low24h': float(eth_t['low24h']),
-        }
+        'price': price,
+        'high24': high24,
+        'low24': low24,
+        'fr': fr,
+        'rsi_4h': rsi_4h,
+        'rsi_1h': rsi_1h,
+        'rsi_30m': rsi_30m,
+        'ma20_4h': ma20_4h,
+        'ma20_1h': ma20_1h,
+        'from_low_pct': from_low_pct,
+        'from_high_pct': from_high_pct,
+        'short_zone': (short_zone_low, short_zone_high),
+        'long_zone': (long_zone_low, long_zone_high),
+        'mid_price': mid_price,
+        'range_size': range_size,
+        'candles_4h': candles_4h,
+        'candles_1h': candles_1h,
     }
 
 def get_balance() -> float:
@@ -137,259 +188,330 @@ def get_positions(inst_id: str = 'BTC-USDT-SWAP') -> List[dict]:
     resp = get(f'{BASE_URL}/api/v5/account/positions?instId={inst_id}')
     return [p for p in resp.get('data', []) if float(p.get('pos', 0)) > 0]
 
-# ============ 止损止盈逻辑 ============
-def calc_stop_loss(entry: float, direction: str) -> float:
-    """3%固定止损"""
-    if direction == 'SHORT':
-        return round(entry * (1 + SL_PCT), 1)
-    else:
-        return round(entry * (1 - SL_PCT), 1)
-
-def check_take_profit(position: Position, current_price: float) -> Optional[str]:
+# ============ 信号检测 ============
+def check_signals(market: dict) -> Tuple[Optional[dict], str]:
     """
-    检查止盈触发
-    返回: None=继续持有, 'EXIT'=触发止盈退出
+    检测交易信号，返回 (signal_dict, reason)
+    signal_dict包含: direction, entry, sl, tp, contracts, risk_pct, reason
     """
-    pnl_pct = (position.entry_price - current_price) / position.entry_price * 100
+    p = market['price']
+    sz = market['short_zone']
+    lz = market['long_zone']
 
-    if position.direction == 'SHORT':
-        # 更新最优价格（最低价）
-        if current_price < position.best_price:
-            position.best_price = current_price
+    # ========== 做空信号 ==========
+    short_conditions = []
 
-        # TP1: 价格移动-1.5%
-        if not position.tp1_triggered and pnl_pct >= TP1_PCT * 100:
-            position.tp1_triggered = True
-            position.trailing_active = True
-            position.trailing_exit = round(position.best_price * (1 + TRAILING_PCT), 1)
-            print(f"  🚀 TP1触发(+1.5%)，激活移动止盈: 从${position.best_price}回升${TRAILING_PCT*100}%到${position.trailing_exit}止盈")
+    # 条件1: 价格进入做空区间（靠近24h高点的30%范围）
+    in_short_zone = sz[0] <= p <= sz[1]
+    short_conditions.append(("价格靠近24h高点", in_short_zone))
 
-        # TP2: 价格移动-2.0%
-        if not position.tp2_triggered and pnl_pct >= TP2_PCT * 100:
-            position.tp2_triggered = True
-            position.trailing_active = True
-            position.trailing_exit = round(position.best_price * (1 + TRAILING_PCT), 1)
-            print(f"  🚀 TP2触发(+2.0%)，移动止盈更新: 从${position.best_price}回升${TRAILING_PCT*100}%到${position.trailing_exit}止盈")
+    # 条件2: RSI超买
+    rsi_ok_short = market["rsi_4h"] > RSI_SHORT_4H or market["rsi_1h"] > RSI_SHORT_1H
+    short_conditions.append(("RSI超买", rsi_ok_short))
 
-        # 移动止盈：价格从最优反弹0.5%则止盈
-        if position.trailing_active:
-            if current_price >= position.trailing_exit:
-                return 'EXIT'
+    # 条件3: 资金费率偏高
+    fr_ok_short = market["fr"] > FR_THRESHOLD
+    short_conditions.append(("资金费率偏高", fr_ok_short))
 
-    else:  # LONG
-        if current_price > position.best_price:
-            position.best_price = current_price
+    # 条件4: 从低点反弹够多（累积涨幅，注意追高风险）
+    rebound_ok = market["from_low_pct"] > (REBOUND_THRESHOLD * 100)
+    short_conditions.append(("从24h低反弹够多", rebound_ok))
 
-        pnl_pct_long = (current_price - position.entry_price) / position.entry_price * 100
+    # 条件5: 价格在MA20上方
+    above_ma = p > market["ma20_4h"]
+    short_conditions.append(("价格在MA20上方", above_ma))
 
-        if not position.tp1_triggered and pnl_pct_long >= TP1_PCT * 100:
-            position.tp1_triggered = True
-            position.trailing_active = True
-            position.trailing_exit = round(position.best_price * (1 - TRAILING_PCT), 1)
-            print(f"  🚀 TP1触发(+1.5%)，激活移动止盈: 从${position.best_price}回落${TRAILING_PCT*100}%到${position.trailing_exit}止盈")
+    # 全部满足才做空
+    if all(c[1] for c in short_conditions):
+        sl = round(p * (1 + SL_PCT), 1)
+        contracts = TEST_CONTRACTS
+        cond_text = " | ".join(["%s: %s" % (c[0], "✅" if c[1] else "❌") for c in short_conditions])
+        return {
+            "direction": "SHORT",
+            "entry": round(p, 1),
+            "sl": sl,
+            "contracts": contracts,
+            "risk_pct": 1.0,
+            "reason": cond_text,
+        }, "做空5条件全满足"
 
-        if not position.tp2_triggered and pnl_pct_long >= TP2_PCT * 100:
-            position.tp2_triggered = True
-            position.trailing_active = True
-            position.trailing_exit = round(position.best_price * (1 - TRAILING_PCT), 1)
-            print(f"  🚀 TP2触发(+2.0%)，移动止盈更新: 从${position.best_price}回落${TRAILING_PCT*100}%到${position.trailing_exit}止盈")
+    # ========== 做多信号 ==========
+    long_conditions = []
 
-        if position.trailing_active:
-            if current_price <= position.trailing_exit:
-                return 'EXIT'
+    # 条件1: 价格靠近24h低点
+    in_long_zone = lz[0] <= p <= lz[1]
+    long_conditions.append(("价格靠近24h低点", in_long_zone))
 
-    return None
+    # 条件2: RSI超卖
+    rsi_ok_long = market["rsi_4h"] < RSI_LONG_4H or market["rsi_1h"] < RSI_LONG_1H
+    long_conditions.append(("RSI超卖", rsi_ok_long))
+
+    # 条件3: 资金费率偏低
+    fr_ok_long = market["fr"] < -FR_THRESHOLD
+    long_conditions.append(("资金费率偏低", fr_ok_long))
+
+    # 条件4: 从高点回落够多
+    pullback_ok = market["from_high_pct"] > (REBOUND_THRESHOLD * 100)
+    long_conditions.append(("从24h高回落够多", pullback_ok))
+
+    # 条件5: 价格在MA20下方
+    below_ma = p < market["ma20_4h"]
+    long_conditions.append(("价格在MA20下方", below_ma))
+
+    if all(c[1] for c in long_conditions):
+        sl = round(p * (1 - SL_PCT), 1)
+        contracts = TEST_CONTRACTS
+        cond_text = " | ".join(["%s: %s" % (c[0], "✅" if c[1] else "❌") for c in long_conditions])
+        return {
+            "direction": "LONG",
+            "entry": round(p, 1),
+            "sl": sl,
+            "contracts": contracts,
+            "risk_pct": 1.0,
+            "reason": cond_text,
+        }, "做多5条件全满足"
+
+    # 无信号
+    zone_info = "做空区间 %.0f-%.0f" % (sz[0], sz[1])
+    return None, zone_info
 
 # ============ 订单执行 ============
-def close_position(inst_id: str = 'BTC-USDT-SWAP') -> bool:
-    positions = get_positions(inst_id)
-    for p in positions:
+def close_all_positions(inst_id: str = 'BTC-USDT-SWAP'):
+    for p in get_positions(inst_id):
         close = post(f'{BASE_URL}/api/v5/trade/close-position', {
-            'instId': inst_id,
-            'posSide': p['posSide'],
-            'mgnMode': 'cross',
+            'instId': inst_id, 'posSide': p['posSide'], 'mgnMode': 'cross',
         })
         if close.get('code') == '0':
             print(f"  ✅ {p['posSide']} 已平仓")
-            return True
-    return False
 
-def place_entry(direction: str, price: float, contracts: int, stop_loss: float, take_profit: float) -> Optional[str]:
-    """挂入场单"""
+def place_entry(direction: str, price: float, contracts: int, sl: float) -> Optional[str]:
     inst_id = 'BTC-USDT-SWAP'
     if direction == 'SHORT':
-        order = post(f'{BASE_URL}/api/v5/trade/order', {
+        r = post(f'{BASE_URL}/api/v5/trade/order', {
             'instId': inst_id, 'tdMode': 'cross',
             'side': 'sell', 'posSide': 'short',
             'ordType': 'limit', 'px': str(price), 'sz': str(contracts),
         })
     else:
-        order = post(f'{BASE_URL}/api/v5/trade/order', {
+        r = post(f'{BASE_URL}/api/v5/trade/order', {
             'instId': inst_id, 'tdMode': 'cross',
             'side': 'buy', 'posSide': 'long',
             'ordType': 'limit', 'px': str(price), 'sz': str(contracts),
         })
-
-    if order.get('code') == '0':
-        oid = order['data'][0]['ordId']
-        # 挂止损OCO（止损用conditional）
+    if r.get('code') == '0':
+        oid = r['data'][0]['ordId']
+        # 挂止损
+        sl_side = 'buy' if direction == 'SHORT' else 'sell'
         sl_order = post(f'{BASE_URL}/api/v5/trade/order-algo', {
             'instId': inst_id, 'tdMode': 'cross',
-            'side': 'buy' if direction == 'SHORT' else 'sell',
-            'posSide': 'short' if direction == 'SHORT' else 'long',
+            'side': sl_side, 'posSide': 'short' if direction == 'SHORT' else 'long',
             'ordType': 'conditional', 'sz': str(contracts),
-            'slTriggerPx': str(stop_loss), 'slOrdPx': '-1',
+            'slTriggerPx': str(sl), 'slOrdPx': '-1',
         })
         if sl_order.get('code') != '0':
-            print(f"  ⚠️ 止损单挂失败: {sl_order.get('msg')}")
+            print(f"  ⚠️ 止损单失败: {sl_order.get('msg')}")
         return oid
-    print(f"  ❌ 入场单失败: {order.get('msg')}")
+    print(f"  ❌ 入场失败: {r.get('msg')}")
     return None
 
-# ============ 信号检测 ============
-def check_signals(market: dict) -> Optional[Signal]:
-    btc = market['btc']
-    price = btc['last']
+# ============ 持仓监控 ============
+@dataclass
+class ActivePosition:
+    direction: str
+    entry: float
+    contracts: int
+    sl: float
+    tp1_triggered: bool = False
+    tp2_triggered: bool = False
+    trailing_active: bool = False
+    best_price: float = 0.0
+    trailing_exit: float = 0.0
+    status: str = 'open'
+    order_id: str = ''
 
-    if SHORT_ZONE[0] <= price <= SHORT_ZONE[1]:
-        sl = calc_stop_loss(price, 'SHORT')
-        return Signal(
-            direction='SHORT', entry_price=round(price, 1),
-            stop_loss=sl, contracts=TEST_CONTRACTS,
-            risk_pct=1.0,
-            reason=f'价格{price}进入做空区间$72,000-$72,500'
-        )
+def monitor_position(pos: ActivePosition, current_price: float) -> Optional[str]:
+    """检查持仓，返回'EXIT'或'STOP'或None"""
+    if pos.direction == 'SHORT':
+        # 更新最优价（最低价）
+        if current_price < pos.best_price:
+            pos.best_price = current_price
 
-    if LONG_ZONE[0] <= price <= LONG_ZONE[1]:
-        sl = calc_stop_loss(price, 'LONG')
-        return Signal(
-            direction='LONG', entry_price=round(price, 1),
-            stop_loss=sl, contracts=TEST_CONTRACTS,
-            risk_pct=1.0,
-            reason=f'价格{price}回踩做多区间$69,500-$70,500'
-        )
+        pnl_pct = (pos.entry - current_price) / pos.entry * 100
+
+        # TP1: 移动1.5%
+        if not pos.tp1_triggered and pnl_pct >= TP1_PCT * 100:
+            pos.tp1_triggered = True
+            pos.trailing_active = True
+            pos.trailing_exit = round(pos.best_price * (1 + TRAILING_PCT), 1)
+            print(f"  🚀 TP1(+1.5%)触发 | 最低{pos.best_price} | 反弹0.5%到{pos.trailing_exit}止盈")
+
+        # TP2: 移动2.0%
+        if not pos.tp2_triggered and pnl_pct >= TP2_PCT * 100:
+            pos.tp2_triggered = True
+            pos.trailing_active = True
+            pos.trailing_exit = round(pos.best_price * (1 + TRAILING_PCT), 1)
+            print(f"  🚀 TP2(+2.0%)触发 | 最低{pos.best_price} | 反弹0.5%到{pos.trailing_exit}止盈")
+
+        # 移动止盈检查
+        if pos.trailing_active and current_price >= pos.trailing_exit:
+            return 'EXIT'
+
+        # 止损
+        if current_price >= pos.sl:
+            return 'STOP'
+
+    else:  # LONG
+        if current_price > pos.best_price:
+            pos.best_price = current_price
+
+        pnl_pct = (current_price - pos.entry) / pos.entry * 100
+
+        if not pos.tp1_triggered and pnl_pct >= TP1_PCT * 100:
+            pos.tp1_triggered = True
+            pos.trailing_active = True
+            pos.trailing_exit = round(pos.best_price * (1 - TRAILING_PCT), 1)
+            print(f"  🚀 TP1(+1.5%)触发 | 最高{pos.best_price} | 回落0.5%到{pos.trailing_exit}止盈")
+
+        if not pos.tp2_triggered and pnl_pct >= TP2_PCT * 100:
+            pos.tp2_triggered = True
+            pos.trailing_active = True
+            pos.trailing_exit = round(pos.best_price * (1 - TRAILING_PCT), 1)
+            print(f"  🚀 TP2(+2.0%)触发 | 最高{pos.best_price} | 回落0.5%到{pos.trailing_exit}止盈")
+
+        if pos.trailing_active and current_price <= pos.trailing_exit:
+            return 'EXIT'
+
+        if current_price <= pos.sl:
+            return 'STOP'
+
     return None
 
-# ============ 信号格式化 ============
-def format_signal(sig: Signal) -> str:
-    dir_emoji = '🔴' if sig.direction == 'SHORT' else '🟢'
+# ============ 信号展示 ============
+def format_signal(sig: dict, zone_desc: str = '') -> str:
+    dir_emoji = '🔴' if sig['direction'] == 'SHORT' else '🟢'
+    margin = (sig['contracts'] * sig['entry'] / 1000) / LEVERAGE
     return f"""
 {'='*50}
-{dir_emoji}【自动交易信号】{sig.direction}
+{dir_emoji}【自动交易信号】{sig['direction']}
 {'='*50}
 品种：BTC-USDT-SWAP
-方向：{sig.direction}
-入场：${sig.entry_price}
-止损：${sig.stop_loss} (+{SL_PCT*100:.0f}%)
+方向：{sig['direction']}
+入场：${sig['entry']}
+止损：${sig['sl']} (+{SL_PCT*100:.0f}%)
 止盈：移动止盈（1.5%触发→0.5%回调 / 2%触发→0.5%回调 / 趋势持有→回调0.5%）
-张数：{sig.contracts}张（迷你测试仓）
-保证金：约{test_margin(sig.entry_price, sig.contracts):.2f}U
-逻辑：{sig.reason}
+张数：{sig['contracts']}张（迷你测试仓）
+保证金：约{margin:.2f}U
+信号条件：
+{sig['reason']}
 {'='*50}
 回复「确认」执行，其他任意内容取消
 """
 
-def test_margin(price: float, contracts: int) -> float:
-    return (contracts * price / 1000) / LEVERAGE
+def format_status(market: dict, has_position: bool, active_pos: Optional[ActivePosition]) -> str:
+    p = market['price']
+    b = get_balance()
+    sz = market['short_zone']
+    lz = market['long_zone']
 
-# ============ 主监控循环 ============
+    in_short_zone = sz[0] <= p <= sz[1]
+    in_long_zone = lz[0] <= p <= lz[1]
+
+    status = """[%s]
+BTC: $%.1f | 余额: %.2fU
+RSI 4H:%.1f | RSI 1H:%.1f | RSI 30m:%.1f
+MA20 4H:$%.0f | MA20 1H:$%.0f
+资金费率: %.3f%%
+从24h低反弹: +%.1f%% | 从24h高回落: -%.1f%%
+做空区间: %.0f-%.0f (%s)
+做多区间: %.0f-%.0f (%s)
+""" % (
+        datetime.now().strftime('%H:%M:%S'),
+        p, b,
+        market['rsi_4h'], market['rsi_1h'], market['rsi_30m'],
+        market['ma20_4h'], market['ma20_1h'],
+        market['fr']*100,
+        market['from_low_pct'], market['from_high_pct'],
+        sz[0], sz[1], "✅在区间" if in_short_zone else "❌不在",
+        lz[0], lz[1], "✅在区间" if in_long_zone else "❌不在",
+    )
+
+    if has_position and active_pos:
+        pnl_pct = (active_pos.entry - p) / active_pos.entry * 100 if active_pos.direction == 'SHORT' else (p - active_pos.entry) / active_pos.entry * 100
+        status += f"""
+持仓: {active_pos.direction} | {active_pos.entry} | {pnl_pct:+.2f}%"""
+
+    return status
+
+# ============ 主循环 ============
 def run_monitor():
     print('=' * 60)
-    print('🦞 混沌龙虾 自动交易系统 v2.0 启动')
-    print('止盈规则: 1.5%触发→0.5%回调 / 2%触发→0.5%回调 / 趋势持有→回调0.5%')
-    print('止损规则: 3% 固定')
+    print('🦞 混沌龙虾 自动交易系统 v3.0 启动')
+    print('信号条件: 多周期RSI + MA20 + 资金费率 + 24h动态区间')
     print('=' * 60)
 
-    balance = get_balance()
-    print(f'账户: {balance:.2f} USDT')
-    print(f'迷你测试仓: {TEST_CONTRACTS}张')
-    print(f'做空区间: ${SHORT_ZONE[0]:,} - ${SHORT_ZONE[1]:,}')
-    print(f'做多区间: ${LONG_ZONE[0]:,} - ${LONG_ZONE[1]:,}')
-    print(f'检查间隔: {TRADE_INTERVAL}秒')
-    print('=' * 60)
-
-    position: Optional[Position] = None
-    pending_signal: Optional[Signal] = None
-    confirmed_direction: Optional[str] = None
-    last_check = time.time()
+    active_pos: Optional[ActivePosition] = None
+    pending_signal: Optional[dict] = None
+    pending_zone: str = ''
+    confirmed_direction: Optional[str] = None  # 等待用户确认
 
     while True:
         try:
             now = datetime.now()
             market = get_market_data()
             balance = get_balance()
-            btc_price = market['btc']['last']
-
-            # 日亏损检查
-            # （简化版，不追踪每日）
-
-            # 检查持仓状态
             positions = get_positions()
+            has_position = len(positions) > 0
+            price = market['price']
 
-            if positions:
-                # 有持仓，监控
-                for p in positions:
-                    if p['instId'] == 'BTC-USDT-SWAP':
-                        direction = p['posSide'].upper()
-                        entry = float(p['avgPx'])
-                        size = float(p['pos'])
+            # ========== 有持仓 ==========
+            if has_position:
+                if active_pos is None or active_pos.status == 'closed':
+                    # 初始化
+                    p = positions[0]
+                    direction = p['posSide'].upper()
+                    entry = float(p['avgPx'])
+                    active_pos = ActivePosition(
+                        direction=direction,
+                        entry=entry,
+                        contracts=int(float(p['pos'])),
+                        sl=round(entry * (1 + SL_PCT if direction == 'SHORT' else 1 - SL_PCT), 1),
+                        best_price=price if direction == 'SHORT' else price,
+                    )
 
-                        if position is None or position.status == 'closed':
-                            # 初始化position对象
-                            position = Position(
-                                direction=direction,
-                                entry_price=entry,
-                                contracts=int(size),
-                                stop_loss=calc_stop_loss(entry, direction),
-                                best_price=btc_price if direction == 'SHORT' else btc_price,
-                            )
+                pnl_pct = (active_pos.entry - price) / active_pos.entry * 100 if active_pos.direction == 'SHORT' else (price - active_pos.entry) / active_pos.entry * 100
+                print(f"[{now.strftime('%H:%M:%S')}] {active_pos.direction} @ {active_pos.entry}→{price} | {pnl_pct:+.2f}%")
 
-                        # 计算当前盈亏
-                        if direction == 'SHORT':
-                            pnl_pct = (entry - btc_price) / entry * 100
-                        else:
-                            pnl_pct = (btc_price - entry) / entry * 100
+                result = monitor_position(active_pos, price)
 
-                        pnl_abs = pnl_pct * entry * size / 100
+                if result == 'EXIT':
+                    print(f"  🎯 移动止盈触发！平仓")
+                    close_all_positions()
+                    active_pos.status = 'closed'
+                    active_pos = None
+                elif result == 'STOP':
+                    print(f"  🛑 止损触发！平仓")
+                    close_all_positions()
+                    active_pos.status = 'closed'
+                    active_pos = None
 
-                        print(f"[{now.strftime('%H:%M:%S')}] {direction} | {entry}→{btc_price} | {pnl_pct:+.2f}% | {pnl_abs:+.2f}U")
-
-                        # 检查止盈
-                        result = check_take_profit(position, btc_price)
-                        if result == 'EXIT':
-                            print(f"  🎯 触发移动止盈！平仓")
-                            close_position()
-                            position.status = 'closed'
-                            position = None
-
-                        # 检查止损（由交易所自动执行，这里仅监控）
-                        sl_price = position.stop_loss
-                        if direction == 'SHORT' and btc_price >= sl_price:
-                            print(f"  🛑 触发止损 {sl_price}")
-                            close_position()
-                            position.status = 'closed'
-                            position = None
-                        elif direction == 'LONG' and btc_price <= sl_price:
-                            print(f"  🛑 触发止损 {sl_price}")
-                            close_position()
-                            position.status = 'closed'
-                            position = None
-
-                        # 过夜检查
-                        if now.hour >= 22 or now.hour < 0:
-                            print(f"  🌙 过夜检查，平仓")
-                            close_position()
-                            position.status = 'closed'
-                            position = None
+                # 过夜平仓
+                if now.hour >= 22 or now.hour < 1:
+                    print(f"  🌙 过夜平仓")
+                    close_all_positions()
+                    active_pos = None
 
                 time.sleep(TRADE_INTERVAL)
                 continue
 
-            # 无持仓，检查信号
-            signal = check_signals(market)
+            # ========== 无持仓，检查信号 ==========
+            print(format_status(market, has_position, active_pos))
+
+            signal, zone_desc = check_signals(market)
+
             if signal:
+                print(format_signal(signal, zone_desc))
                 pending_signal = signal
-                print(format_signal(signal))
+                confirmed_direction = signal['direction']
 
             time.sleep(TRADE_INTERVAL)
 
