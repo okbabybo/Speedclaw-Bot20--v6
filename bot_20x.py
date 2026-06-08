@@ -345,17 +345,17 @@ def get_signal(symbol):
             counter_trend_sig = "SHORT"; counter_trend_reasons = ct_reasons
     
     # ===== v5.4 双模式：判断当前属于强趋势还是震荡 =====
-    # 强趋势模式：4H+1H EMA共振（趋势跟随，RSI门槛放宽到50）
-    # 震荡/逆势模式：趋势不明确或EMA矛盾（原有RSI门槛45/55）
-    STRONG_TREND_MODE = long_ready  # 4H+1H同时确认上升
+    # 强趋势模式：4H+1H EMA共振（趋势跟随，RSI门槛放宽到55）
+    # 震荡/逆势模式：趋势不明确或EMA矛盾（原有RSI门槛45）
+    STRONG_TREND_MODE = trend_up  # v5.4：只要EMA趋势确认即可，不强制RSI门槛
     
     # ===== 做多 =====
     long_score = 0; long_reasons = []
     
-    # 核心条件（强趋势模式：RSI<50即可；震荡模式：RSI<45）
-    long_rsi_thresh = 50 if STRONG_TREND_MODE else 45
+    # 核心条件（强趋势模式：RSI<55即可；震荡模式：RSI<45）
+    long_rsi_thresh = 55 if STRONG_TREND_MODE else 45
     if r1 < 40: long_score += 1; long_reasons.append(f"R1={r1:.0f}<40")
-    elif r1 < long_rsi_thresh: long_score += 0.5; long_reasons.append(f"R1={r1:.0f}<{long_rsi_thresh}" + (" [趋势跟随]" if STRONG_TREND_MODE else ""))  # 放宽区
+    elif r1 < long_rsi_thresh: long_score += (1.0 if STRONG_TREND_MODE else 0.5); long_reasons.append(f"R1={r1:.0f}<{long_rsi_thresh}" + (" [趋势跟随]" if STRONG_TREND_MODE else ""))  # 强趋势模式RSI权重翻倍
     if r4 < 50: long_score += 1; long_reasons.append(f"R4={r4:.0f}<50")
     if r15 < 40: long_score += 1; long_reasons.append(f"R15={r15:.0f}<40")
     if trend_up: long_score += 1; long_reasons.append("趋势↑" + (" [共振]" if STRONG_TREND_MODE else ""))
@@ -371,19 +371,22 @@ def get_signal(symbol):
     
     # 加分项
     if div_bull: long_score += 2; long_reasons.append("底背")
-    if vr > 1.5: long_score += 1; long_reasons.append(f"V={vr:.1f}x")
+    # v5.4: 强趋势模式下成交量要求放宽（趋势确认优先于量能）
+    if vr > (1.0 if STRONG_TREND_MODE else 1.5): long_score += 1; long_reasons.append(f"V={vr:.1f}x")
     
     # 趋势确认（多周期一致性）
     if long_ready: long_score += 1.5; long_reasons.append(f"EMA确认({trend_score:.1f})")
+    # v5.4新增：趋势向上时给EMA确认加分（不要求long_ready）
+    if trend_up and not long_ready: long_score += 0.5; long_reasons.append(f"EMA向上({trend_score:.1f})")
     
-    if long_score >= 6.5:
+    if long_score >= (6.5 if not STRONG_TREND_MODE else 2.5):
         sig = "LONG"; reasons = long_reasons
     elif counter_trend_sig:
         sig = counter_trend_sig; reasons = counter_trend_reasons
     
     # ===== 做空（双模式）=====
     short_score = 0; short_reasons = []
-    short_rsi_thresh = 50 if short_ready else 55  # 强趋势模式RSI>50即可；震荡模式RSI>55
+    short_rsi_thresh = 45 if short_ready else 55  # 强趋势模式RSI>45即可；震荡模式RSI>55
     
     if r1 > 35: short_score += 1; short_reasons.append(f"R1={r1:.0f}>35")  # 优化：40→35，下降趋势RSI35已是高处
     elif r1 > 30: short_score += 0.5; short_reasons.append(f"R1={r1:.0f}>30")  # 放宽区
@@ -411,7 +414,7 @@ def get_signal(symbol):
     if div_bear: short_score += 2; short_reasons.append("顶背")
     if vr > 1.5: short_score += 1; short_reasons.append(f"V={vr:.1f}x")
     
-    if short_score >= 6.5:
+    if short_score >= (6.5 if not short_ready else 5.0):
         sig = "SHORT"; reasons = short_reasons
     elif counter_trend_sig:
         sig = counter_trend_sig; reasons = counter_trend_reasons
@@ -635,6 +638,17 @@ def main():
                         # 【关键修复】：有反向信号时直接走反向流程，否则走正常趋势确认
                         if not reverse_target:
                             trend_ok = info['long_ready'] if direction == "LONG" else info['short_ready']
+                            # ===== v5.4 趋势跟随模式放宽：如果v5.4信号触发（RSI1H<50+趋势向上 或 RSI1H>50+趋势向下），放宽trend_ok要求
+                            if not trend_ok:
+    
+                                # LONG: v5.4趋势跟随触发，EMA确认但RSI4H>60导致long_ready=False → 允许信号
+                                if direction == "LONG" and sig == "LONG" and info['r1'] < 55 and info['trend_up']:
+                                    trend_ok = True
+                                    log(f"{symbol} {direction} v5.4趋势跟随信号(R1={info['r1']:.0f}<50,趋势↑)放宽trend_ok")
+                                # SHORT: v5.4趋势跟随触发，EMA确认但RSI4H<40导致short_ready=False → 允许信号
+                                elif direction == "SHORT" and sig == "SHORT" and info['r1'] > 45 and not info['trend_up']:
+                                    trend_ok = True
+                                    log(f"{symbol} {direction} v5.4趋势跟随信号(R1={info['r1']:.0f}>50,趋势↓)放宽trend_ok")
                             if not trend_ok:
                                 log(f"{symbol} {direction} 趋势不符 {info['trend_reasons']} 跳过")
                                 continue
