@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""20x杠杆 精准信号策略 v5.3
+"""20x杠杆 精准信号策略 v5.4
+v5.4优化：双模式信号 - 强趋势中(4H+1H共振)自动切换到趋势跟随模式(RSI<50做多/>50做空)，避免踏空
 v5.3优化：持仓中趋势反转保护 - 检测到持仓方向与4H趋势矛盾时预警（用户控制SL，AI只报不操作）
 v5.2优化：API重试机制 + 趋势冲突过滤 + 趋势反转预警
 修复：网络抖动时频繁崩溃 + 4H/1H趋势矛盾时逆势开仓 + 趋势反转时无预警
@@ -343,23 +344,29 @@ def get_signal(symbol):
         if ct_score >= 6.5:
             counter_trend_sig = "SHORT"; counter_trend_reasons = ct_reasons
     
+    # ===== v5.4 双模式：判断当前属于强趋势还是震荡 =====
+    # 强趋势模式：4H+1H EMA共振（趋势跟随，RSI门槛放宽到50）
+    # 震荡/逆势模式：趋势不明确或EMA矛盾（原有RSI门槛45/55）
+    STRONG_TREND_MODE = long_ready  # 4H+1H同时确认上升
+    
     # ===== 做多 =====
     long_score = 0; long_reasons = []
     
-    # 核心条件（放宽到30/70）
+    # 核心条件（强趋势模式：RSI<50即可；震荡模式：RSI<45）
+    long_rsi_thresh = 50 if STRONG_TREND_MODE else 45
     if r1 < 40: long_score += 1; long_reasons.append(f"R1={r1:.0f}<40")
-    elif r1 < 45: long_score += 0.5; long_reasons.append(f"R1={r1:.0f}<45")  # 放宽区
+    elif r1 < long_rsi_thresh: long_score += 0.5; long_reasons.append(f"R1={r1:.0f}<{long_rsi_thresh}" + (" [趋势跟随]" if STRONG_TREND_MODE else ""))  # 放宽区
     if r4 < 50: long_score += 1; long_reasons.append(f"R4={r4:.0f}<50")
     if r15 < 40: long_score += 1; long_reasons.append(f"R15={r15:.0f}<40")
-    if trend_up: long_score += 1; long_reasons.append("趋势↑")
+    if trend_up: long_score += 1; long_reasons.append("趋势↑" + (" [共振]" if STRONG_TREND_MODE else ""))
     
     # StochRSI EMA平滑（减少噪音）
     if sk15 < 20: long_score += 2; long_reasons.append(f"StochK15={sk15:.0f}<20")
     if sk1 < 20: long_score += 1; long_reasons.append(f"StochK1={sk1:.0f}<20")
     
-    # 放宽区(35-40)必须有StochRSI极端值才能触发
+    # 放宽区(40-{long_rsi_thresh})必须有StochRSI极端值才能触发
     stoich_extreme = sk15 < 20 or sk1 < 20
-    if 40 <= r1 < 45 and not stoich_extreme:
+    if 40 <= r1 < long_rsi_thresh and not stoich_extreme:
         long_score -= 0.5; long_reasons.append("放宽区无Stoch极端-0.5")
     
     # 加分项
@@ -374,15 +381,20 @@ def get_signal(symbol):
     elif counter_trend_sig:
         sig = counter_trend_sig; reasons = counter_trend_reasons
     
-    # ===== 做空 =====
+    # ===== 做空（双模式）=====
     short_score = 0; short_reasons = []
+    short_rsi_thresh = 50 if short_ready else 55  # 强趋势模式RSI>50即可；震荡模式RSI>55
     
     if r1 > 35: short_score += 1; short_reasons.append(f"R1={r1:.0f}>35")  # 优化：40→35，下降趋势RSI35已是高处
     elif r1 > 30: short_score += 0.5; short_reasons.append(f"R1={r1:.0f}>30")  # 放宽区
     if r4 > 50: short_score += 1; short_reasons.append(f"R4={r4:.0f}>50")
     if r4 < 40: short_score += 0.5; short_reasons.append(f"R4={r4:.0f}<40强势")  # 新增：4H超卖强势确认做空
     if r15 > 55: short_score += 1; short_reasons.append(f"R15={r15:.0f}>55")  # 优化：60→55，更灵敏
-    if not trend_up: short_score += 1; short_reasons.append("趋势↓")
+    if not trend_up: short_score += 1; short_reasons.append("趋势↓" + (" [共振]" if short_ready else ""))
+    
+    # v5.4新增：强趋势模式下RSI>50即给分（不做空等待极端值）
+    if short_ready and r1 > short_rsi_thresh:
+        short_score += 0.5; short_reasons.append(f"R1={r1:.0f} [趋势跟随]")
     
     # StochRSI EMA平滑（减少噪音）
     if sk15 > 80: short_score += 2; short_reasons.append(f"StochK15={sk15:.0f}>80")
@@ -394,7 +406,7 @@ def get_signal(symbol):
         short_score -= 0.5; short_reasons.append("放宽区无Stoch极端-0.5")
     
     # 趋势确认（多周期一致性）
-    if short_ready: short_score += 1.5; short_reasons.append(f"EMA确认({short_score:.1f})")
+    if short_ready: short_score += 1.5; short_reasons.append(f"EMA确认({trend_score:.1f})")
     
     if div_bear: short_score += 2; short_reasons.append("顶背")
     if vr > 1.5: short_score += 1; short_reasons.append(f"V={vr:.1f}x")
@@ -475,7 +487,7 @@ def calc_qty(balance, atr, price):
 
 def main():
     log("="*60)
-    log("20x 精准信号v5.3 | 复利风控增强 | 分批止盈")
+    log("20x 精准信号v5.4 | 双模式趋势跟随 | 分批止盈")
     log("="*60)
     
     state_files = {
