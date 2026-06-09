@@ -85,6 +85,8 @@ def check_crash_safety():
 DRAWDOWN_PROTECT = 0.15  # 利润保护：账户从高点回撤15%则减半仓
 DRAWDOWN_COOLDOWN = 1800   # 回撤保护冷却期：30分钟内不重复触发
 DRAWDOWN_COOLDOWN_FILE = "/root/.openclaw/workspace/.drawdown_cooldown"  # 冷却期记录
+DRAWDOWN_LOCK_FILE = "/root/.openclaw/workspace/.drawdown_lock"  # 回撤后冷静期锁
+DRAWDOWN_LOCK_SECS = 1800  # 回撤保护后冷静30分钟，禁止开新仓
 HIGH_WATER_FILE = "/root/.openclaw/workspace/.high_water"  # 历史最高余额记录
 RISK_DANGER = 20       # 危险区余额阈值（低于此值风险减半）
 RISK_DANGER_PCT = 0.05  # 危险区风控：风险从10%降到5%
@@ -386,7 +388,7 @@ def get_signal(symbol):
     # ===== 做空条件（全部满足才做空）=====
     # r4<15时为超卖警戒，不允许做空（价格可能瞬间反弹）
     oversold_guard = r4 < 15
-    short_ready = (cur < ema1h_20 and r1 > 35 and r4 >= 15 and r4 < 60 and (market_trending or r1 > 40)) and not market_weak
+    short_ready = (cur < ema1h_20 and r1 > 50 and r4 >= 15 and r4 < 60 and (market_trending or r1 > 55)) and not market_weak
     
     # 趋势评分（用于日志显示）
     trend_score = 0
@@ -534,6 +536,7 @@ def get_signal(symbol):
         'trend_up': trend_up, 'trend_score': trend_score,
         'long_ready': long_ready, 'short_ready': short_ready,
         'trend_reasons': trend_reasons,
+        'trend4h_price': trend4h_price,  # 新增：4H EMA趋势方向
         'div': 'bull' if div_bull else ('bear' if div_bear else None),
         'sig': sig, 'reasons': reasons,
         'counter_trend': counter_trend_sig is not None,
@@ -579,6 +582,21 @@ def check_drawdown_protection(balance):
         return True, high
     return False, high
 
+def is_drawdown_locked():
+    """检查是否在回撤冷静期内"""
+    try:
+        with open(DRAWDOWN_LOCK_FILE) as f:
+            unlock_time = float(f.read().strip())
+        return time.time() < unlock_time
+    except:
+        return False
+
+def trigger_drawdown_lock():
+    """触发回撤冷静期"""
+    with open(DRAWDOWN_LOCK_FILE, "w") as f:
+        f.write(str(time.time() + DRAWDOWN_LOCK_SECS))
+    log(f"回撤冷静期锁定：{DRAWDOWN_LOCK_SECS//60}分钟内禁止开新仓")
+
 def calc_qty(balance, atr, price):
     risk_pct = get_risk_pct(balance)
     risk_amount = balance * risk_pct
@@ -619,6 +637,11 @@ def main():
                 time.sleep(30)
                 continue
             
+            # 回撤冷静期：回撤保护触发后禁止开新仓
+            if is_drawdown_locked():
+                time.sleep(15)
+                continue
+            
             # === 复利风控：更新历史最高 & 检查回撤 ===
             high_water = get_high_water()
             if bal > high_water:
@@ -634,6 +657,7 @@ def main():
             drawback_triggered, high = check_drawdown_protection(bal)
             if drawback_triggered and (now - last_drawdown) > DRAWDOWN_COOLDOWN:
                 log(f"⚠️ 回撤保护触发：高点${high:.2f} → 当前${bal:.2f}，减半仓")
+                trigger_drawdown_lock()  # 锁定30分钟冷静期
                 with open(DRAWDOWN_COOLDOWN_FILE, "w") as f:
                     f.write(str(now))
                 # 遍历所有状态文件，减半所有持仓
@@ -766,7 +790,7 @@ def main():
                                     trend_ok = True
                                     log(f"{symbol} {direction} v5.4趋势跟随信号(R1={info['r1']:.0f}<50,趋势↑)放宽trend_ok")
                                 # SHORT: v5.4趋势跟随触发，EMA确认但RSI4H<40导致short_ready=False → 允许信号
-                                elif direction == "SHORT" and sig == "SHORT" and info['r1'] > 45 and not info['trend_up']:
+                                elif direction == "SHORT" and sig == "SHORT" and info['r1'] > 50 and not info['trend_up'] and not info.get('trend4h_price', True):
                                     trend_ok = True
                                     log(f"{symbol} {direction} v5.4趋势跟随信号(R1={info['r1']:.0f}>50,趋势↓)放宽trend_ok")
                             if not trend_ok:
