@@ -49,6 +49,39 @@ ACCEL_SCORE_BOOST = 2  # 加速模式下SHORT信号评分额外加分
 # === 复利风控参数 ===
 MAX_POS_PCT = 0.30      # 单标仓位上限：不超过余额的30%
 MAX_TOTAL_EXPOSURE = 1.50  # 总仓位上限：所有仓位不超过余额的150%
+
+# === 安全保卫 ===
+CRASH_COUNT_FILE = "/root/.openclaw/workspace/.crash_count"
+CRASH_WINDOW_SECS = 600      # 10分钟内
+CRASH_LIMIT = 5              # 超过5次重启则进入安全模式
+
+def get_crash_count():
+    try:
+        with open(CRASH_COUNT_FILE) as f:
+            data = json.load(f)
+        return data.get("count", 0), data.get("first_time", 0)
+    except:
+        return 0, 0
+
+def increment_crash():
+    count, first = get_crash_count()
+    now = time.time()
+    # 如果窗口期已过，重置计数
+    if first == 0 or (now - first) > CRASH_WINDOW_SECS:
+        count, first = 0, now
+    count += 1
+    with open(CRASH_COUNT_FILE, "w") as f:
+        json.dump({"count": count, "first_time": first}, f)
+    return count
+
+def check_crash_safety():
+    """检查是否在安全模式下，拒绝交易"""
+    count, first = get_crash_count()
+    now = time.time()
+    if first > 0 and (now - first) <= CRASH_WINDOW_SECS and count >= CRASH_LIMIT:
+        log(f"⚠️ 安全模式：10分钟内重启{count}次，等待冷静期...")
+        return False  # False = 拒绝交易
+    return True
 DRAWDOWN_PROTECT = 0.15  # 利润保护：账户从高点回撤15%则减半仓
 DRAWDOWN_COOLDOWN = 1800   # 回撤保护冷却期：30分钟内不重复触发
 DRAWDOWN_COOLDOWN_FILE = "/root/.openclaw/workspace/.drawdown_cooldown"  # 冷却期记录
@@ -232,6 +265,43 @@ def get_all_positions(symbol):
     except Exception as e:
         log(f"get_all_positions错误: {e}")
     return positions
+
+def startup_self_check():
+    """启动自检：验证所有API返回类型正确，不正确则拒绝启动"""
+    log("启动自检：验证API响应类型...")
+    errors = []
+    try:
+        bal = get_balance()
+        if not isinstance(bal, (int, float)):
+            errors.append(f"get_balance返回{type(bal).__name__}")
+        else:
+            log(f"  ✅ get_balance OK: ${bal:.2f}")
+    except Exception as e:
+        errors.append(f"get_balance失败: {e}")
+    
+    try:
+        klines = get_klines("BTCUSDT", "1m", 1)
+        if not isinstance(klines, list):
+            errors.append(f"get_klines返回{type(klines).__name__}")
+        else:
+            log(f"  ✅ get_klines OK: {len(klines)}条")
+    except Exception as e:
+        errors.append(f"get_klines失败: {e}")
+    
+    try:
+        pos = get_all_positions("BTCUSDT")
+        if not isinstance(pos, dict):
+            errors.append(f"get_all_positions返回{type(pos).__name__}")
+        else:
+            log(f"  ✅ get_all_positions OK")
+    except Exception as e:
+        errors.append(f"get_all_positions失败: {e}")
+    
+    if errors:
+        log(f"自检失败: {', '.join(errors)}，拒绝启动以防止事故")
+        log("请检查网络和API状态后手动重启")
+        exit(1)
+    log("自检全部通过")
 
 def do_order(symbol, side, posSide, qty):
     # 下单前先记录日志（防止crash后无法追溯）
@@ -525,6 +595,14 @@ def main():
     log("20x 精准信号v5.4 | 双模式趋势跟随 | 分批止盈")
     log("="*60)
     
+    # 启动自检：验证API响应类型，不正确则拒绝启动
+    startup_self_check()
+    
+    # 记录本次启动（用于安全模式计数）
+    crash_count = increment_crash()
+    if crash_count >= 3:
+        log(f"⚠️ 重启次数较多({crash_count}次/10分钟内)，进入监控模式")
+    
     state_files = {
         "BTCUSDT": {"LONG": "/root/.openclaw/workspace/st_btc_long.json", "SHORT": "/root/.openclaw/workspace/st_btc_short.json"},
         "ETHUSDT": {"LONG": "/root/.openclaw/workspace/st_eth_long.json", "SHORT": "/root/.openclaw/workspace/st_eth_short.json"},
@@ -535,6 +613,11 @@ def main():
             bal = get_balance()
             now = time.time()
             hour_utc = int(datetime.utcnow().strftime('%H'))
+            
+            # 安全模式检查：频繁重启则停止交易
+            if not check_crash_safety():
+                time.sleep(30)
+                continue
             
             # === 复利风控：更新历史最高 & 检查回撤 ===
             high_water = get_high_water()
