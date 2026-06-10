@@ -38,10 +38,10 @@ RISK_PCT = 0.10
 MIN_BAL = 3
 OPEN_COOLDOWN = 0
 
-SL_ATR_MULT = 0.02   # 改为固定2% SL（原1.5×ATR太紧）
+SL_ATR_MULT = 0.025  # 优化：2.5% SL，20x下更稳健
 TP1_PCT = 0.02       # 优化：3%→2%，更灵敏止盈，积小胜为大胜
 TP2_TRIGGER = 0.04   # TP2从6%→4%，跟上TP1节奏
-TP2_BUFFER = 0.008    # 追踪回撤1%→0.8%，更快保护利润
+TP2_BUFFER = 0.01    # 追踪回撤1%，增加呼吸空间
 WIN_STREAK_ACCEL = 2   # 连赢2次TP1后激活加速模式
 WIN_STREAK_THRESH = 0.05  # 加速模式下RSI门槛临时降5%
 ACCEL_SCORE_BOOST = 2  # 加速模式下SHORT信号评分额外加分
@@ -82,11 +82,11 @@ def check_crash_safety():
         log(f"⚠️ 安全模式：10分钟内重启{count}次，等待冷静期...")
         return False  # False = 拒绝交易
     return True
-DRAWDOWN_PROTECT = 0.15  # 利润保护：账户从高点回撤15%则减半仓
+DRAWDOWN_PROTECT = 0.30  # 小账户回撤30%才触发（原15%太敏感）
 DRAWDOWN_COOLDOWN = 1800   # 回撤保护冷却期：30分钟内不重复触发
 DRAWDOWN_COOLDOWN_FILE = "/root/.openclaw/workspace/.drawdown_cooldown"  # 冷却期记录
 DRAWDOWN_LOCK_FILE = "/root/.openclaw/workspace/.drawdown_lock"  # 回撤后冷静期锁
-DRAWDOWN_LOCK_SECS = 1800  # 回撤保护后冷静30分钟，禁止开新仓
+DRAWDOWN_LOCK_SECS = 900   # 回撤保护后冷静15分钟，禁止开新仓
 HIGH_WATER_FILE = "/root/.openclaw/workspace/.high_water"  # 历史最高余额记录
 RISK_DANGER = 20       # 危险区余额阈值（低于此值风险减半）
 RISK_DANGER_PCT = 0.05  # 危险区风控：风险从10%降到5%
