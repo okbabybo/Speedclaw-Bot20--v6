@@ -337,6 +337,10 @@ def get_signal(symbol):
     k1h = get_klines(symbol, "1h", 100)
     k15m = get_klines(symbol, "15m", 100)
     
+    # 数据不足时直接返回None，防止None比较崩溃
+    if len(k4h) < 25 or len(k1h) < 25 or len(k15m) < 25:
+        log(f"{symbol} K线数据不足，跳过本次信号")
+        return None
     c4h = [float(k[4]) for k in k4h]
     c1h = [float(k[4]) for k in k1h]
     c15m = [float(k[4]) for k in k15m]
@@ -629,7 +633,7 @@ def main():
     
     while True:
         try:
-            bal = get_balance()
+            bal = get_balance() or 0
             now = time.time()
             hour_utc = int(datetime.utcnow().strftime('%H'))
             
@@ -713,6 +717,8 @@ def main():
             for symbol in ["BTCUSDT", "ETHUSDT"]:
                 sf = state_files[symbol]
                 info = get_signal(symbol)
+                if info is None:
+                    time.sleep(15); continue
                 positions = get_all_positions(symbol)
                 
                 # === v5.2 新增：趋势反转预警 ===
@@ -738,7 +744,7 @@ def main():
                     
                     if not pos:
                         sig = info['sig']
-                        closed_time = s.get("closed", now - OPEN_COOLDOWN - 1)
+                        closed_time = s.get("closed") or (now - OPEN_COOLDOWN - 1)
                         win_streak = s.get("win_streak", 0)  # 继承上次的连赢记录
                         accel_active = win_streak >= WIN_STREAK_ACCEL
                         reverse_target = None  # 反向信号标志：需要反向开仓时设置
