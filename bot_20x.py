@@ -97,6 +97,7 @@ TREND_STATE_FILE = "/root/.openclaw/workspace/.trend_state"
 TREND_WARN_COOLDOWN = 300  # 冷却5分钟
 WARN_FILE = "/root/.openclaw/workspace/.trend_warn"  # 待发送预警文件
 MIN_TRADE_INTERVAL = 30  # 最小下单间隔（秒），防止过度交易
+MANUAL_CLOSE_COOLDOWN = 600  # 手动平仓后冷静期（秒），10分钟内禁止同方向新开仓
 
 def load_trend_state():
     try:
@@ -728,6 +729,8 @@ def main():
                     if s.get("pos") and not pos:
                         log(f"{symbol} {direction} 手动平仓已同步 | 上次:{s.get('last','?')}")
                         s["closed"] = now
+                        s["manual_close_dir"] = direction  # 记录被手动平仓的方向
+                        s["manual_close_time"] = now  # 冷静期起点
                         s["last"] = s.get("last", "closed")
                         s.pop("pos", None)
                         with open(sf_file, "w") as f: json.dump(s, f)
@@ -804,6 +807,10 @@ def main():
                         # 防过度交易：检查最近一次下单时间
                         if last_trade_time and (now - last_trade_time) < MIN_TRADE_INTERVAL:
                             log(f"{symbol} {direction} 防过度交易：距上次下单{MIN_TRADE_INTERVAL}秒内，跳过")
+                        # 手动平仓冷静期：10分钟内禁止同方向新开仓（允许反向开仓）
+                        elif sig_ok and s.get("manual_close_time") and s.get("manual_close_dir") == direction and (now - s["manual_close_time"]) < MANUAL_CLOSE_COOLDOWN:
+                            remaining = int(MANUAL_CLOSE_COOLDOWN - (now - s["manual_close_time"]))
+                            log(f"{symbol} {direction} 手动平仓冷静期：还剩{remaining}秒，跳过")
                         elif sig_ok and reasons and bal > MIN_BAL and (now - closed_time) > OPEN_COOLDOWN:
                             actual_dir = reverse_target if reverse_target else direction
                             qty = calc_qty(bal, info['atr'], info['cur'])
