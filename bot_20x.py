@@ -97,7 +97,7 @@ TREND_STATE_FILE = "/root/.openclaw/workspace/.trend_state"
 TREND_WARN_COOLDOWN = 300  # 冷却5分钟
 WARN_FILE = "/root/.openclaw/workspace/.trend_warn"  # 待发送预警文件
 MIN_TRADE_INTERVAL = 30  # 最小下单间隔（秒），防止过度交易
-MANUAL_CLOSE_COOLDOWN = 600  # 手动平仓后冷静期（秒），10分钟内禁止同方向新开仓
+MANUAL_CLOSE_COOLDOWN = 60  # 手动平仓后冷静期（秒），1分钟内禁止同方向新开仓
 
 def load_trend_state():
     try:
