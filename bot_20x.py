@@ -40,7 +40,7 @@ OPEN_COOLDOWN = 0
 
 SL_ATR_MULT = 0.025  # 优化：2.5% SL，20x下更稳健
 TP1_PCT = 0.02       # 优化：3%→2%，更灵敏止盈，积小胜为大胜
-TP2_TRIGGER = 0.04   # TP2从6%→4%，跟上TP1节奏
+TP2_TRIGGER = 0.03   # P2优化：4%→3%，更容易触发止盈
 TP2_BUFFER = 0.01    # 追踪回撤1%，增加呼吸空间
 WIN_STREAK_ACCEL = 2   # 连赢2次TP1后激活加速模式
 WIN_STREAK_THRESH = 0.05  # 加速模式下RSI门槛临时降5%
