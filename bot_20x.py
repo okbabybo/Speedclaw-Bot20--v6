@@ -212,6 +212,27 @@ def calc_atr(klines, period=14):
         trs.append(tr)
     return sum(trs[-period:]) / period if trs else 0
 
+def calc_macd(prices, fast=12, slow=26, signal=9):
+    """MACD指标：趋势动量确认"""
+    if len(prices) < slow+1: return 0, 0, 0
+    ema_fast = calc_ema(prices, fast)
+    ema_slow = calc_ema(prices, slow)
+    macd_line = ema_fast - ema_slow
+    # Signal line (简化：用MACD的EMA)
+    macd_history = [macd_line] * signal
+    signal_line = calc_ema(macd_history, signal) if len(macd_history) >= signal else macd_line
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+def calc_bollinger(prices, period=20, mult=2):
+    """布林带：极端值+支撑阻力"""
+    if len(prices) < period: return None, None, None
+    sma = sum(prices[-period:]) / period
+    std = (sum((p - sma) ** 2 for p in prices[-period:]) / period) ** 0.5
+    upper = sma + mult * std
+    lower = sma - mult * std
+    return upper, sma, lower
+
 def api_retry_call(func, *args, **kwargs):
     """"带指数退避的API重试机制"""
     delay = API_RETRY_DELAY
@@ -363,6 +384,15 @@ def get_signal(symbol):
     market_trending = adx_val >= ADX_TREND_THRESH
     market_weak = adx_val < ADX_WEAK_THRESH
 
+    # ===== MACD趋势动量检测 =====
+    macd_line, macd_signal, macd_hist = calc_macd(c1h)
+    macd_bullish = macd_hist > 0  # MACD柱在零轴上方
+    macd_bearish = macd_hist < 0  # MACD柱在零轴下方
+
+    # ===== 布林带极端值检测 =====
+    bb_upper, bb_mid, bb_lower = calc_bollinger(c15m, 20, 2)
+    bb_position = (cur - bb_lower) / (bb_upper - bb_lower) if bb_upper and bb_lower and bb_upper != bb_lower else 0.5  # 价格在布林带位置(0=下轨,1=上轨)
+
     # ===== 多周期趋势确认 v3：EMA20 + 成交量确认 =====
     # EMA20 趋势判断（替代原 MA20）
     ema4h_20 = calc_ema(c4h, 20)
@@ -482,6 +512,11 @@ def get_signal(symbol):
     if div_bull: long_score += 2; long_reasons.append("底背")
     # v5.4: 强趋势模式下成交量要求放宽（趋势确认优先于量能）
     if vr > (1.0 if STRONG_TREND_MODE else 1.5): long_score += 1; long_reasons.append(f"V={vr:.1f}x")
+    # v5.5新增：MACD动量确认（做多需MACD柱>0）
+    if macd_bullish: long_score += 1; long_reasons.append("MACD多头")
+    # v5.5新增：布林带极端值确认（价格接近下轨=超卖）
+    if bb_position < 0.2: long_score += 1.5; long_reasons.append(f"BB下轨={bb_position:.0%}")
+    elif bb_position < 0.3: long_score += 1; long_reasons.append(f"BB偏低={bb_position:.0%}")
     
     # 趋势确认（多周期一致性）
     if long_ready: long_score += 1.5; long_reasons.append(f"EMA确认({trend_score:.1f})")
@@ -522,6 +557,11 @@ def get_signal(symbol):
     
     if div_bear: short_score += 2; short_reasons.append("顶背")
     if vr > 1.5: short_score += 1; short_reasons.append(f"V={vr:.1f}x")
+    # v5.5新增：MACD动量确认（做空需MACD柱<0）
+    if macd_bearish: short_score += 1; short_reasons.append("MACD空头")
+    # v5.5新增：布林带极端值确认（价格接近上轨=超买）
+    if bb_position > 0.8: short_score += 1.5; short_reasons.append(f"BB上轨={bb_position:.0%}")
+    elif bb_position > 0.7: short_score += 1; short_reasons.append(f"BB偏高={bb_position:.0%}")
     
     if short_score >= (6.5 if not short_ready else 5.0):
         sig = "SHORT"; reasons = short_reasons
@@ -543,6 +583,8 @@ def get_signal(symbol):
         'trend_reasons': trend_reasons,
         'trend4h_price': trend4h_price,  # 新增：4H EMA趋势方向
         'div': 'bull' if div_bull else ('bear' if div_bear else None),
+        'macd_bullish': macd_bullish, 'macd_bearish': macd_bearish,  # v5.5新增
+        'bb_position': bb_position,  # v5.5新增：布林带位置
         'sig': sig, 'reasons': reasons,
         'counter_trend': counter_trend_sig is not None,
         'trend_conflict': trend_conflict
