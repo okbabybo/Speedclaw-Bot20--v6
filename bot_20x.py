@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """20x杠杆 精准信号策略 v5.6
-v5.6优化：移除ETH（币安$20门槛从未成交），聚焦BTC；冷静期0秒→60秒；熔断间隔15分钟→30分钟
+v5.6优化：熔断间隔15分钟→30分钟（用户确认）
 v5.5优化：新增MACD+布林带确认信号，精准度提升
 v5.4优化：双模式信号 - 强趋势中(4H+1H共振)自动切换到趋势跟随模式(RSI<50做多/>50做空)，避免踏空
 v5.3优化：持仓中趋势反转保护 - 检测到持仓方向与4H趋势矛盾时预警（用户控制SL，AI只报不操作）
@@ -19,7 +19,7 @@ ADX_PERIOD = 14
 ADX_TREND_THRESH = 25
 ADX_WEAK_THRESH = 20
 LOSS_STREAK_LIMIT = 3
-LOSS_STREAK_PAUSE = 30*60  # 熔断间隔30分钟
+LOSS_STREAK_PAUSE = 15*60
 ATR_BREAKOUT_MULT = 2.0
 ATR_TIGHT_MULT = 1.0
 LOW_LIQ_START = 3
@@ -38,7 +38,7 @@ last_trade_time = 0
 LEVER = 20
 RISK_PCT = 0.10
 MIN_BAL = 3
-OPEN_COOLDOWN = 60   # 冷静期60秒
+OPEN_COOLDOWN = 0
 
 SL_ATR_MULT = 0.025  # 优化：2.5% SL，20x下更稳健
 TP1_PCT = 0.02       # 优化：3%→2%，更灵敏止盈，积小胜为大胜
@@ -672,6 +672,7 @@ def main():
     
     state_files = {
         "BTCUSDT": {"LONG": "/root/.openclaw/workspace/st_btc_long.json", "SHORT": "/root/.openclaw/workspace/st_btc_short.json"},
+        "ETHUSDT": {"LONG": "/root/.openclaw/workspace/st_eth_long.json", "SHORT": "/root/.openclaw/workspace/st_eth_short.json"},
     }
     
     while True:
@@ -729,7 +730,7 @@ def main():
             # === 复利风控：总仓位上限检查（按实际保证金算）===
             # 总暴露 = Σ(持仓数量 × 当前价格 ÷ 杠杆) = 实际占用保证金
             total_exposure = 0
-            for sym in ["BTCUSDT"]:
+            for sym in ["BTCUSDT", "ETHUSDT"]:
                 try:
                     cur_price = float(get_klines(sym, "1m", 1)[0][4])
                 except:
@@ -757,7 +758,7 @@ def main():
             elif loss_streak_count >= LOSS_STREAK_LIMIT:
                 loss_streak_count = 0; log("熔断恢复")
 
-            for symbol in ["BTCUSDT"]:
+            for symbol in ["BTCUSDT", "ETHUSDT"]:
                 sf = state_files[symbol]
                 info = get_signal(symbol)
                 if info is None:
