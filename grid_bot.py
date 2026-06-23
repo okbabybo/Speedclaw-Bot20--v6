@@ -40,11 +40,11 @@ CRASH_LIMIT        = 3      # 熔断：连续3亏暂停
 CRASH_PAUSE        = 900    # 熔断暂停15分钟
 MANUAL_COOLDOWN    = 300    # 手动平仓识别冷却5分钟
 
-# 资金分级
-TIER1 = 20    # 余额$20-50：每币$20，最多1个币
-TIER2 = 50    # 余额$50-200：每币$50
-TIER3 = 300   # 余额$200-1000：每币$300
-TIER4 = 600   # 余额>$1000：每币$600（提升资金利用率）
+# 资金分级（现货无杠杆，大幅提升利用率）
+TIER1 = 50     # 余额$20-50：每币$50
+TIER2 = 150    # 余额$50-200：每币$150
+TIER3 = 500    # 余额$200-1000：每币$500
+TIER4 = 1500   # 余额>$1000：每币$1500（无强平风险，可充分利用）
 
 # 分批建仓参数
 PHASE1_GRIDS = 2    # 第一批先开2格
@@ -598,6 +598,7 @@ class StateManager:
         self.total_profit_taken = self.data.get('total_profit_taken', 0)
         self.loss_streak = self.data.get('loss_streak', 0)
         self.last_loss_time = self.data.get('last_loss_time', 0)
+        self.loss_cooldown = self.data.get('loss_cooldown', 0)  # 止损后冷静期秒数
         self.lock_until = self.data.get('lock_until', 0)
         self.daily_loss = self.data.get('daily_loss', 0)
         self.daily_reset_time = self.data.get('daily_reset_time', 0)
@@ -615,6 +616,7 @@ class StateManager:
             'total_profit_taken': self.total_profit_taken,
             'loss_streak': self.loss_streak,
             'last_loss_time': self.last_loss_time,
+            'loss_cooldown': self.loss_cooldown,
             'lock_until': self.lock_until,
             'daily_loss': self.daily_loss,
             'daily_reset_time': self.daily_reset_time,
@@ -634,7 +636,21 @@ class StateManager:
     def record_loss(self):
         self.loss_streak += 1
         self.last_loss_time = time.time()
+        # 止损后冷静期：1亏等5分钟，2亏等10分钟，3亏等15分钟（熔断）
+        self.loss_cooldown = min(self.loss_streak * 300, CRASH_PAUSE)
         self.save()
+
+    def check_loss_cooldown(self):
+        """止损后冷静期检查：1亏等5分，2亏等10分，3亏等15分"""
+        if self.loss_streak >= 1 and self.loss_cooldown > 0:
+            elapsed = time.time() - self.last_loss_time
+            if elapsed < self.loss_cooldown:
+                remaining = int(self.loss_cooldown - elapsed)
+                log(f"[亏损冷静期] {self.loss_streak}连亏，还需等待{remaining//60}分钟")
+                return False
+            else:
+                self.loss_cooldown = 0  # 冷静期结束
+        return True
 
     def record_win(self):
         if self.loss_streak > 0:
@@ -651,6 +667,8 @@ class StateManager:
                 return False
             else:
                 self.loss_streak = 0
+                self.last_loss_time = 0
+                self.loss_cooldown = 0  # 冷静期也一起清零
         return True
 
     def check_drawdown_protection(self, balance):
@@ -735,14 +753,21 @@ def main():
                 time.sleep(30)
                 continue
 
+            # === 熔断保护：连续3亏暂停15分钟 ===
             if not sm.check_crash_protection():
                 time.sleep(30)
                 continue
 
-            # === 熊市加强检查：熔断后若市场仍是TREND_DOWN，禁止开仓 ===
-            if sm.loss_streak >= 1 and sm.market_mode in ("TREND_DOWN", "CRISIS", "VOLATILE_OVERBOUGHT"):
-                log(f"[熊市锁定] 连亏后市场={sm.market_mode}，禁止开仓等待")
+            # === 熊市加强检查：熔断触发后(3连亏)若市场仍是下跌，禁止开仓 ===
+            # 只有熔断真正触发时才启用熊市锁定（避免1-2亏就锁死）
+            if sm.loss_streak >= CRASH_LIMIT and sm.market_mode in ("TREND_DOWN", "CRISIS", "VOLATILE_OVERBOUGHT"):
+                log(f"[熊市锁定] 熔断{sm.loss_streak}连亏 + 市场={sm.market_mode}，禁止开仓等待止跌")
                 time.sleep(60)
+                continue
+
+            # === 止损后冷静期：1亏等5分，2亏等10分，3亏等15分 ===
+            if not sm.check_loss_cooldown():
+                time.sleep(30)
                 continue
 
             if not sm.check_drawdown_protection(balance):
