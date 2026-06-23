@@ -43,8 +43,20 @@ MANUAL_COOLDOWN    = 300    # 手动平仓识别冷却5分钟
 # 资金分级
 TIER1 = 20    # 余额$20-50：每币$20，最多1个币
 TIER2 = 50    # 余额$50-200：每币$50
-TIER3 = 150   # 余额$200-1000：每币$150
-TIER4 = 300   # 余额>$1000：每币$300
+TIER3 = 300   # 余额$200-1000：每币$300
+TIER4 = 600   # 余额>$1000：每币$600（提升资金利用率）
+
+# 分批建仓参数
+PHASE1_GRIDS = 2    # 第一批先开2格
+PHASE2_DELAY = 300  # 第二批延迟5分钟（等止盈确认）
+PROFIT_LOCK = 0.50  # 止盈利润50%锁定，30%复利，20%buffer
+
+# ATR自适应网格
+ATR_GRID_MAP = {
+    'high':   (2, 0.010),   # ATR>5%：2格，每格1.0%
+    'medium': (4, 0.006),   # ATR 2-5%：4格，每格0.6%
+    'low':    (6, 0.004),   # ATR<2%：6格，每格0.4%
+}
 
 # 运行参数
 CHECK_INTERVAL    = 20    # 实时检查（秒）
@@ -174,6 +186,15 @@ def detect_market_mode(symbol, ex):
     klines_raw = ex.get_klines(symbol, "1h", ATR_PERIOD+5)
     atr = calc_atr(klines_raw) if klines_raw else 0
 
+    # === ATR自适应网格（波动大的币少格宽距）===
+    atr_pct = atr / cur if cur > 0 else 0.02
+    if atr_pct > 0.05:   # 高波动（>5% ATR）
+        atr_grids, atr_gp = ATR_GRID_MAP['high']
+    elif atr_pct > 0.02:  # 中波动（2-5%）
+        atr_grids, atr_gp = ATR_GRID_MAP['medium']
+    else:                   # 低波动（<2%）
+        atr_grids, atr_gp = ATR_GRID_MAP['low']
+
     # === 模式判断（优先级从高到低）===
     mode = "RANGE_BOUND"  # 默认
 
@@ -196,15 +217,16 @@ def detect_market_mode(symbol, ex):
     else:
         mode = "RANGE_BOUND"
 
-    # === 模式系数（用于资金分配）===
-    mode_params = {
-        "TREND_UP":            {"pos_pct": 1.0,  "grids": 2, "grid_profit": GRID_PROFIT,     "trend_bias": 1.0},
-        "TREND_DOWN":          {"pos_pct": 0.3,  "grids": 2, "grid_profit": GRID_PROFIT,     "trend_bias": 0.0},
-        "RANGE_BOUND":         {"pos_pct": 0.8,  "grids": 6, "grid_profit": GRID_PROFIT,     "trend_bias": 0.3},
-        "VOLATILE_OVERSOLD":   {"pos_pct": 1.2,  "grids": 4, "grid_profit": GRID_VOL_PROFIT, "trend_bias": 0.7},
-        "VOLATILE_OVERBOUGHT": {"pos_pct": 0.0,  "grids": 0, "grid_profit": GRID_PROFIT,     "trend_bias": 0.0},
-        "CRISIS":              {"pos_pct": 0.0,  "grids": 0, "grid_profit": GRID_PROFIT,     "trend_bias": 0.0},
+    # === 模式系数（用于资金分配，grids/grid_profit用ATR自适应）===
+    base_params = {
+        "TREND_UP":            {"pos_pct": 1.0,  "grids": 2, "grid_profit": GRID_PROFIT,      "trend_bias": 1.0},
+        "TREND_DOWN":          {"pos_pct": 0.3,  "grids": 2, "grid_profit": GRID_PROFIT,      "trend_bias": 0.0},
+        "RANGE_BOUND":         {"pos_pct": 0.8,  "grids": atr_grids, "grid_profit": atr_gp,  "trend_bias": 0.3},
+        "VOLATILE_OVERSOLD":   {"pos_pct": 1.2,  "grids": min(atr_grids, 4), "grid_profit": atr_gp, "trend_bias": 0.7},
+        "VOLATILE_OVERBOUGHT": {"pos_pct": 0.0,  "grids": 0, "grid_profit": atr_gp,          "trend_bias": 0.0},
+        "CRISIS":              {"pos_pct": 0.0,  "grids": 0, "grid_profit": atr_gp,          "trend_bias": 0.0},
     }[mode]
+    mode_params = base_params
 
     # === 评分 ===
     trend_score = 0
@@ -253,23 +275,28 @@ class GridEngine:
     def __init__(self, symbol, entry_price, grids, grid_profit, atr, ex, capital):
         self.symbol = symbol
         self.entry_price = entry_price
-        self.grids = grids
+        self.max_grids = grids          # 总格数上限
         self.grid_profit = grid_profit
         self.atr = atr
         self.ex = ex
         self.capital = capital
+        self.pending_profit = 0         # 止盈待分配利润
+        self.last_tp_time = 0          # 上次止盈时间（用于分批延迟）
 
         grid_range = max(atr * 3, entry_price * 0.12)
         self.upper = entry_price + grid_range / 2
         self.lower = max(entry_price - grid_range / 2, entry_price * 0.94)
         self.grid_width = (self.upper - self.lower) / grids
-        self.positions = {}  # {idx: {buy_price, qty, sold, target, sl, ts_triggered, ts_price}}
+        self.positions = {}  # {idx: {buy_price, qty, sold, target, sl, ts_triggered, ts_price, profit_locked}}
+
+        # 分批开仓：先开PHASE1_GRIDS格
+        self._open_count = 0  # 已开格数（不含pending）
 
         log(f"[网格] {symbol} 中心${entry_price:.2f} [{self.lower:.2f}~{self.upper:.2f}] "
             f"{grids}格/{grid_profit*100:.1f}% 资金${capital:.2f}")
 
     def grid_index(self, price):
-        if price >= self.upper: return self.grids
+        if price >= self.upper: return self.max_grids
         if price <= self.lower: return -1
         return int((price - self.lower) / self.grid_width)
 
@@ -280,18 +307,21 @@ class GridEngine:
                 step = float(f['stepSize']); break
         return float(qty) // step * step
 
-    def invest_per_grid(self):
+    def invest_per_grid(self, locked_profit=0):
         active = len([p for p in self.positions.values() if not p.get('sold')])
-        if active >= self.grids: return 0
-        return min(self.capital / (self.grids - active), self.capital * 0.25)
+        if active >= self.max_grids: return 0
+        # 分批：只用capital + 30%待分配利润 / 剩余格数
+        base = self.capital + locked_profit
+        per_grid_max = base * 0.35  # 单格不超过总资金的35%
+        return min(per_grid_max, base / (self.max_grids - active))
 
-    def buy_grid(self, idx, price):
-        invest = self.invest_per_grid()
-        if invest < 11: return
+    def buy_grid(self, idx, price, locked_profit=0):
+        invest = self.invest_per_grid(locked_profit)
+        if invest < 11: return False
 
         qty = self._round_qty(invest / price)
-        if qty <= 0: return
-        if qty * price < self.ex.get_min_notional(self.symbol): return
+        if qty <= 0: return False
+        if qty * price < self.ex.get_min_notional(self.symbol): return False
 
         try:
             ok = self.ex.market_buy(self.symbol, qty)
@@ -302,11 +332,33 @@ class GridEngine:
                     'sl': price * (1 - SL_PCT),
                     'ts_triggered': False, 'ts_price': 0,
                     'bought_at': time.time(),
+                    'profit_locked': invest * self.grid_profit * PROFIT_LOCK,  # 止盈时锁定50%
                 }
+                self._open_count += 1
                 log(f"[格买入] {self.symbol}格{idx}@{price:.4f} qty={qty:.4f} "
-                    f"→{price*(1+self.grid_profit):.4f} SL{price*(1-SL_PCT):.4f}")
+                    f"→{price*(1+self.grid_profit):.4f} SL{price*(1-SL_PCT):.4f} "
+                    f"(已开{self._open_count}/{self.max_grids}格)")
+                return True
         except Exception as e:
             log(f"[格买入失败] {self.symbol}格{idx}: {e}")
+        return False
+
+    def check_phased_open(self, cur_price):
+        """分批开仓：止盈后延迟5分钟才开下一批"""
+        now = time.time()
+        # 已开满 或 没有待分配利润
+        if self._open_count >= self.max_grids: return
+        if self.pending_profit <= 0: return
+        # 止盈后必须等5分钟才能开下一批
+        if now - self.last_tp_time < PHASE2_DELAY: return
+
+        # 找到最低未开的格子
+        for idx in range(self.max_grids):
+            if idx not in self.positions:
+                # 用30%利润开下一格
+                self.buy_grid(idx, cur_price, locked_profit=self.pending_profit)
+                self.pending_profit = 0  # 用完了
+                break
 
     def _sell_grid(self, idx, cur_price, reason):
         pos = self.positions.get(idx)
@@ -317,10 +369,20 @@ class GridEngine:
             ok = self.ex.market_sell(self.symbol, qty)
             if ok:
                 pnl = (cur_price - pos['buy_price']) / pos['buy_price'] * 100
+                invest = pos['buy_price'] * qty
+                profit = cur_price * qty - invest
                 log(f"[格卖出] {self.symbol}格{idx}@{cur_price:.4f}({pnl:+.2f}%) {reason}")
                 pos['sold'] = True
                 pos['sold_price'] = cur_price
                 pos['sold_at'] = time.time()
+                pos['released'] = False
+                # 止盈时：50%锁定，30%进入pending_profit复利，20%buffer
+                if reason.startswith('TP'):
+                    locked = profit * PROFIT_LOCK
+                    reinvest = profit * (1 - PROFIT_LOCK)  # 30%复利
+                    self.pending_profit += reinvest
+                    self.last_tp_time = time.time()
+                    log(f"  → 利润${profit:.2f} | 锁定50%=${locked:.2f} | 复利30%=${reinvest:.2f} | buffer20%")
         except Exception as e:
             log(f"[格卖出失败] {self.symbol}格{idx}: {e}")
 
@@ -351,8 +413,8 @@ class GridEngine:
             if pos.get('ts_triggered') and cur_price <= pos['ts_price']:
                 self._sell_grid(g_idx, cur_price, f"TS")
 
-        # 买入新格子
-        if 0 <= idx < self.grids:
+        # 分批买入：Phase1只开前2格，后续由check_phased_open控制
+        if 0 <= idx < self.max_grids and self._open_count < PHASE1_GRIDS:
             if idx not in self.positions:
                 self.buy_grid(idx, cur_price)
             else:
@@ -361,12 +423,11 @@ class GridEngine:
                     self.buy_grid(idx, cur_price)
 
     def release_funds(self):
-        released = 0
+        """标记已卖出格子，释放追踪状态（不计算金额，因为余额已更新）"""
         for pos in self.positions.values():
             if pos.get('sold') and not pos.get('released'):
-                released += pos['buy_price'] * pos['qty']
                 pos['released'] = True
-        return released
+        return 0  # 不再累加金额，避免与balance重复计算
 
     def detect_manual_close(self, has_position_api):
         for idx, pos in list(self.positions.items()):
@@ -403,7 +464,7 @@ class GridEngine:
             r = max(self.atr * 3, new_price * 0.12)
             self.upper = new_price + r / 2
             self.lower = max(new_price - r / 2, new_price * 0.94)
-            self.grid_width = (self.upper - self.lower) / self.grids
+            self.grid_width = (self.upper - self.lower) / self.max_grids
 
 # ===================== 趋势引擎 =====================
 class TrendEngine:
@@ -541,6 +602,7 @@ class StateManager:
         self.daily_loss = self.data.get('daily_loss', 0)
         self.daily_reset_time = self.data.get('daily_reset_time', 0)
         self.last_manual_check = 0
+        self.market_mode = "RANGE_BOUND"  # 当前市场模式（扫描时更新）
 
     def _load(self):
         try:
@@ -560,6 +622,10 @@ class StateManager:
         })
         with open(self.fpath, "w") as f:
             json.dump(self.data, f, indent=2, default=str)
+
+    def update_mode(self, mode):
+        self.market_mode = mode
+        self.data['market_mode'] = mode
 
     def get_balance(self):
         try: return self.ex.get_balance("USDT")
@@ -673,6 +739,12 @@ def main():
                 time.sleep(30)
                 continue
 
+            # === 熊市加强检查：熔断后若市场仍是TREND_DOWN，禁止开仓 ===
+            if sm.loss_streak >= 1 and sm.market_mode in ("TREND_DOWN", "CRISIS", "VOLATILE_OVERBOUGHT"):
+                log(f"[熊市锁定] 连亏后市场={sm.market_mode}，禁止开仓等待")
+                time.sleep(60)
+                continue
+
             if not sm.check_drawdown_protection(balance):
                 # 全部止损
                 for eng in grid_engines.values():
@@ -711,6 +783,9 @@ def main():
                     "RANGE_BOUND": "📊", "CRISIS": "💥"
                 }
                 sig_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪"}
+                # 更新全局市场模式（取BTC的主导模式作为大盘风向）
+                btc_mode = signals.get('BTCUSDT', {}).get('mode', 'RANGE_BOUND')
+                sm.update_mode(btc_mode)
 
                 for sym, info in signals.items():
                     me = mode_emoji.get(info['mode'], "⚪")
@@ -740,9 +815,9 @@ def main():
                 active_trend = len([e for e in trend_engines.values() if e.position])
                 active_total = active_grids + active_trend
 
-                # 释放网格卖出资金
-                released = sum(eng.release_funds() for eng in grid_engines.values())
-                investable = balance + released
+                # 卖出资金归账：balance已经是最新值，不再重复加released（避免双重计算）
+                # release_funds()的返回值仅供参考，不加入investable
+                investable = balance
 
                 # BUY信号排序
                 buy_list = sorted(
@@ -758,7 +833,7 @@ def main():
                     if active_total >= MAX_POSITIONS: break
                     if investable < 15: break
 
-                    per_coin = calc_position_size(balance, max(active_total, 1), info)
+                    per_coin = calc_position_size(investable, max(active_total, 1), info)
                     if info['trend_bias'] >= 0.7:
                         eng = TrendEngine(sym, ex)
                         if eng.buy(info['price'], per_coin / info['price']):
@@ -811,7 +886,8 @@ def main():
             for sym, eng in list(grid_engines.items()):
                 try:
                     cur = ex.get_price(sym)
-                    eng.check(cur)
+                    eng.check(cur)           # 检查止盈/止损/追踪
+                    eng.check_phased_open(cur)  # 分批开仓检查
                     eng.adjust_center(cur)
                 except: pass
             for sym, eng in list(trend_engines.items()):
