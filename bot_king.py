@@ -610,6 +610,7 @@ class StateManager:
         self.daily_loss = self.data.get('daily_loss', 0)
         self.daily_reset_time = self.data.get('daily_reset_time', 0)
         self.market_mode = "RANGE_BOUND"
+        self._daily_start_balance = self.data.get('daily_start_balance', 0)
 
     def _load(self):
         try:
@@ -626,6 +627,7 @@ class StateManager:
             'lock_until': self.lock_until,
             'daily_loss': self.daily_loss,
             'daily_reset_time': self.daily_reset_time,
+            'daily_start_balance': self.data.get('daily_start_balance', self.high_water if self.high_water > 0 else 0),
             'saved_at': time.time(),
         })
         with open(self.fpath, "w") as f:
@@ -682,14 +684,20 @@ class StateManager:
     def check_daily_loss(self, balance):
         """日亏保护：单日亏损>8%暂停1小时，UTC0点重置"""
         now = time.time()
-        # UTC0点重置
+        # UTC0点重置：记录新的一天的起始余额
         if self.daily_reset_time == 0 or (now - self.daily_reset_time) >= 86400:
             self.daily_loss = 0
             self.daily_reset_time = now
+            self.data['daily_start_balance'] = balance  # 记录今天开盘余额
+            if self.high_water == 0:
+                self.high_water = balance
             self.save()
             return True
-        if self.high_water > 0:
-            daily_pnl = (balance - self.high_water) / self.high_water
+        # 从daily_reset时的余额计算当日亏损
+        daily_start = self.data.get('daily_start_balance', balance)
+        if daily_start > 0:
+            daily_pnl = (balance - daily_start) / daily_start
+            self.daily_loss = daily_pnl
             if daily_pnl < -MAX_DAILY_LOSS:
                 log(f"[⚠️ 日亏保护] 单日亏损{abs(daily_pnl)*100:.1f}% > {MAX_DAILY_LOSS*100:.0f}%，暂停1小时")
                 self.lock_until = time.time() + 3600
@@ -886,9 +894,25 @@ def main():
                     active_total += 1
                     log(f"[网格开仓] {sym}@{info['price']:.2f} {info['grids']}格 模式:{info['mode']}")
 
-            # === SELL信号平仓 ===
+            # === SELL信号平仓（区分止盈 vs 止损）===
             for sym, info in signals.items():
-                if info['mode'] in ("VOLATILE_OVERBOUGHT", "CRISIS", "TREND_DOWN"):
+                # VOL_OVERBOUGHT/CRISIS = 止盈离场，record_win
+                # TREND_DOWN = 止损离场，record_loss
+                if info['mode'] in ("VOLATILE_OVERBOUGHT",):
+                    if sym in grid_engines:
+                        try:
+                            cur = info['price']
+                            for idx in list(grid_engines[sym].positions.keys()):
+                                grid_engines[sym]._sell_grid(idx, cur, f"市场信号-{info['mode']}")
+                            sm.record_win()
+                        except: pass
+                    if sym in trend_engines and trend_engines[sym].position:
+                        try:
+                            cur = info['price']
+                            trend_engines[sym]._sell(cur, f"市场信号-{info['mode']}")
+                            sm.record_win()
+                        except: pass
+                elif info['mode'] in ("CRISIS", "TREND_DOWN"):
                     if sym in grid_engines:
                         try:
                             cur = info['price']
