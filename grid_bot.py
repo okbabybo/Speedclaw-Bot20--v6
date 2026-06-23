@@ -47,9 +47,14 @@ TIER3 = 500    # 余额$200-1000：每币$500
 TIER4 = 1500   # 余额>$1000：每币$1500（无强平风险，可充分利用）
 
 # 分批建仓参数
-PHASE1_GRIDS = 2    # 第一批先开2格
-PHASE2_DELAY = 300  # 第二批延迟5分钟（等止盈确认）
 PROFIT_LOCK = 0.50  # 止盈利润50%锁定，30%复利，20%buffer
+PHASE2_DELAY = 300  # 第二批延迟5分钟（等止盈确认）
+
+def get_phase1_grids(balance):
+    """根据余额动态决定第一批开几个格（资金少时只开1格）"""
+    if balance < 100:   return 1  # $50-100：先开1格试探
+    if balance < 300:   return 2  # $100-300：开2格
+    return 2               # $300+：开2格
 
 # ATR自适应网格
 ATR_GRID_MAP = {
@@ -272,7 +277,7 @@ def calc_position_size(balance, active_count, mode_params):
 
 # ===================== 网格引擎 =====================
 class GridEngine:
-    def __init__(self, symbol, entry_price, grids, grid_profit, atr, ex, capital):
+    def __init__(self, symbol, entry_price, grids, grid_profit, atr, ex, capital, phase1_limit=2):
         self.symbol = symbol
         self.entry_price = entry_price
         self.max_grids = grids          # 总格数上限
@@ -280,6 +285,7 @@ class GridEngine:
         self.atr = atr
         self.ex = ex
         self.capital = capital
+        self.phase1_limit = phase1_limit  # 第一批最多开几个格（动态）
         self.pending_profit = 0         # 止盈待分配利润
         self.last_tp_time = 0          # 上次止盈时间（用于分批延迟）
 
@@ -330,7 +336,7 @@ class GridEngine:
                     'buy_price': price, 'qty': qty, 'sold': False,
                     'target': price * (1 + self.grid_profit),
                     'sl': price * (1 - SL_PCT),
-                    'ts_triggered': False, 'ts_price': 0,
+                    'ts_triggered': False, 'ts_price': 0, 'ts_high': 0,
                     'bought_at': time.time(),
                     'profit_locked': invest * self.grid_profit * PROFIT_LOCK,  # 止盈时锁定50%
                 }
@@ -344,20 +350,18 @@ class GridEngine:
         return False
 
     def check_phased_open(self, cur_price):
-        """分批开仓：止盈后延迟5分钟才开下一批"""
+        """分批开仓：止盈后延迟5分钟才开下一批（phase1→phase2）"""
         now = time.time()
-        # 已开满 或 没有待分配利润
         if self._open_count >= self.max_grids: return
         if self.pending_profit <= 0: return
-        # 止盈后必须等5分钟才能开下一批
         if now - self.last_tp_time < PHASE2_DELAY: return
+        if self._open_count >= self.phase1_limit: return  # 未到phase1上限，不开
 
-        # 找到最低未开的格子
+        # 开phase2的格子
         for idx in range(self.max_grids):
             if idx not in self.positions:
-                # 用30%利润开下一格
                 self.buy_grid(idx, cur_price, locked_profit=self.pending_profit)
-                self.pending_profit = 0  # 用完了
+                self.pending_profit = 0
                 break
 
     def _sell_grid(self, idx, cur_price, reason):
@@ -404,17 +408,24 @@ class GridEngine:
                 self._sell_grid(g_idx, cur_price, f"TP+{self.grid_profit*100:.1f}%")
                 continue
 
-            # 追踪止损
+            # 追踪止损（动态上调触发价，不让利润回吐）
             profit = (cur_price - bp) / bp
-            if profit > 0.06 and not pos.get('ts_triggered'):
-                pos['ts_triggered'] = True
-                pos['ts_price'] = cur_price * (1 - TS_PCT)
-                log(f"[TS激活] {self.symbol}格{g_idx}@{cur_price:.4f}")
+            if profit > 0.06:
+                if not pos.get('ts_triggered'):
+                    pos['ts_triggered'] = True
+                    pos['ts_price'] = cur_price * (1 - TS_PCT)
+                    pos['ts_high'] = cur_price  # 记录TS激活后的最高价
+                    log(f"[TS激活] {self.symbol}格{g_idx}@{cur_price:.4f} 触发价={pos['ts_price']:.4f}")
+                else:
+                    # 价格创新高：上调TS触发价，锁定更多利润
+                    if cur_price > pos.get('ts_high', 0):
+                        pos['ts_high'] = cur_price
+                        pos['ts_price'] = cur_price * (1 - TS_PCT)
             if pos.get('ts_triggered') and cur_price <= pos['ts_price']:
                 self._sell_grid(g_idx, cur_price, f"TS")
 
-        # 分批买入：Phase1只开前2格，后续由check_phased_open控制
-        if 0 <= idx < self.max_grids and self._open_count < PHASE1_GRIDS:
+        # 分批买入：Phase1只开phase1_limit格，后续由check_phased_open控制
+        if 0 <= idx < self.max_grids and self._open_count < self.phase1_limit:
             if idx not in self.positions:
                 self.buy_grid(idx, cur_price)
             else:
@@ -504,7 +515,7 @@ class TrendEngine:
     def has_position(self):
         if not self.position: return False
         try:
-            trades = self.ex.get_my_trades(self.symbol, limit=5)
+            trades = self.ex.get_my_trades(self.symbol, limit=20)  # 至少查20条，防部分平仓漏检
             for t in trades:
                 if t.get('isBuyer'):
                     tp = float(t.get('price', 0))
@@ -826,7 +837,7 @@ def main():
                 # === 手动平仓检测 ===
                 for sym in list(grid_engines.keys()):
                     try:
-                        trades = ex.get_my_trades(sym, limit=10)
+                        trades = ex.get_my_trades(sym, limit=20)  # 至少查20条
                         has_api = any(t.get('isBuyer') for t in trades)
                         grid_engines[sym].detect_manual_close(has_api)
                     except: pass
@@ -868,8 +879,10 @@ def main():
                             active_total += 1
                             log(f"[趋势开仓] {sym}@{info['price']:.2f} 模式:{info['mode']}")
                     elif info['grids'] > 0:
+                        phase1 = get_phase1_grids(balance)  # 根据余额动态决定首批格数
                         eng = GridEngine(sym, info['price'], info['grids'],
-                                        info['grid_profit'], info['atr'], ex, per_coin)
+                                        info['grid_profit'], info['atr'], ex, per_coin,
+                                        phase1_limit=phase1)
                         grid_engines[sym] = eng
                         investable -= per_coin
                         active_grids += 1
