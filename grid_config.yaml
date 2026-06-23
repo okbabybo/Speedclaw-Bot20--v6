@@ -1,0 +1,29 @@
+# 现货智能网格+趋势机器人 v2.0 配置
+api_key: "QccKkNLbtV61rJpOms4h2E0RWoZMfMhG2ar3v9tueF5kbQ6KkN4sUf5CFLLkMhzx"
+secret: "Q549z4g3QlOnVs0PDSCzW6Xy2nVt9763DMqWo64MLLDoUeV8MigrUGUQn2nZTDuU"
+
+log_file: /root/.openclaw/workspace/grid_bot.log
+state_dir: /root/.openclaw/workspace/
+
+# 币种（可扩展）
+coins:
+  - BTCUSDT
+  - ETHUSDT
+  - BNBUSDT
+  - SOLUSDT
+  - AVAXUSDT
+  - XRPUSDT
+
+# 策略参数
+init_capital: 100        # 起始本金（复利基准）
+max_positions: 3         # 最多同时持几个币
+grid_count: 6            # 网格格数
+grid_profit: 0.006       # 每格目标利润 0.6%
+compound_pct: 1.0         # 利润复利比例 100%
+take_profit_pct: 0.20    # 盈利20%时提取部分利润
+sl_pct: 0.12             # 止损 12%
+ts_pct: 0.08             # 追踪止损 8%
+
+# 运行参数
+check_interval: 30       # 检查间隔（秒）
+state_save_every: 120   # 状态保存间隔（秒）

@@ -1,0 +1,34 @@
+# 币安现货机器人配置 v1.0
+api_key: "QccKkNLbtV61rJpOms4h2E0RWoZMfMhG2ar3v9tueF5kbQ6KkN4sUf5CFLLkMhzx"
+secret: "Q549z4g3QlOnVs0PDSCzW6Xy2nVt9763DMqWo64MLLDoUeV8MigrUGUQn2nZTDuU"
+
+log_file: /root/.openclaw/workspace/spot_bot.log
+state_dir: /root/.openclaw/workspace/
+
+# 交易币种（注意：OKX的SUI永续不是SUIUSDT，币安现货是SUIUSDT）
+coins:
+  - BTCUSDT
+  - ETHUSDT
+  - BNBUSDT
+  - SOLUSDT
+  - SUIUSDT
+  - AVAXUSDT
+  - XRPUSDT
+
+# 策略参数
+max_hold: 3           # 最多同时持有几个币
+alloc_pct: 0.15       # 每个币分配余额的15%
+min_invest: 11         # 最小投资金额（USDT，币安大部分现货$10）
+sl_pct: 0.05          # 止损5%
+tp_pct: 0.08          # 止盈8%
+
+# 技术指标参数
+rsi_period: 14
+macd_fast: 12
+macd_slow: 26
+macd_signal: 9
+bb_period: 20
+bb_mult: 2.0
+
+# 运行参数
+signal_interval: 60    # 信号检查间隔（秒）
