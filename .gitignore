@@ -1,0 +1,15 @@
+# 敏感配置（包含API密钥）
+config_exchange.yaml
+config_*.yaml
+
+# 状态文件
+/st_*.json
+/.crash_count
+/.drawdown_*
+/.high_water
+/.trend_*
+/.trend_warn
+
+# 临时文件
+*.log
+*.tmp
