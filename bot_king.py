@@ -353,7 +353,7 @@ class GridEngine:
         self.grid_width = (self.upper - self.lower) / self.max_grids if self.max_grids > 0 else grid_range
         self.positions = {}
         self.position = {'symbol': symbol, 'qty': 0, 'entry': entry_price}
-        self._all_sold = False  # 标记所有格都已平仓
+        self._all_sold = False  # 标记所有格都已平仓（重启后恢复）
 
     def get_grid_index(self, price):
         if price <= self.lower: return 0
@@ -483,7 +483,17 @@ class GridEngine:
             log(f"[格卖出失败] {self.symbol}格{idx}: {e}")
 
     def adjust_center(self, cur_price):
-        pass
+        """网格区间动态调整：当价格持续偏离中心>20%时，重新居中"""
+        center = (self.upper + self.lower) / 2
+        drift = (cur_price - center) / center if center > 0 else 0
+        # 价格偏离网格中心>25%时，重新计算区间
+        if abs(drift) > 0.25:
+            new_range = max(self.atr * 3, cur_price * 0.12)
+            self.upper = cur_price + new_range / 2
+            self.lower = cur_price - new_range / 2
+            self.grid_width = (self.upper - self.lower) / self.max_grids
+            log(f"[网格重置] {self.symbol} @{cur_price:.4f} 偏离{drift*100:+.0f}%，重新居中 "
+                f"区间[{self.lower:.4f}, {self.upper:.4f}]")
 
     def has_position(self):
         return any(not p.get('sold') and p['qty'] > 0 for p in self.positions.values())
@@ -507,17 +517,19 @@ class TrendEngine:
     def __init__(self, symbol, ex, sm=None):
         self.symbol = symbol
         self.ex = ex
-        self.sm = sm           # StateManager引用
+        self.sm = sm
         self.position = None
         self.entry_price = 0
         self.ts_triggered = False
         self.ts_price = 0
+        self.peak_price = 0  # 持仓期间最高价（用于趋势破坏判断）
 
     def buy(self, price, qty):
         try:
             if self.ex.market_buy(self.symbol, qty):
                 self.position = {'qty': qty, 'entry': price, 'tp1_done': False}
                 self.entry_price = price
+                self.peak_price = price
                 log(f"[趋势买入] {self.symbol}@{price:.4f} qty={qty:.4f}")
                 return True
         except: pass
@@ -539,6 +551,15 @@ class TrendEngine:
 
         if self.ts_triggered and cur_price <= self.ts_price:
             self._sell(cur_price, "TS")
+            return
+
+        # 趋势破坏退出：从峰值回落>8%且趋势已确认破坏
+        if cur_price > self.peak_price:
+            self.peak_price = cur_price
+        drawdown_from_peak = (self.peak_price - cur_price) / self.peak_price if self.peak_price > 0 else 0
+        if drawdown_from_peak > 0.08 and self.peak_price > entry * 1.10:
+            log(f"[趋势破坏] {self.symbol}@{cur_price:.4f} 从峰值{self.peak_price:.4f}回落{drawdown_from_peak*100:.1f}%，趋势破坏止损")
+            self._sell(cur_price, "TREND_BREAK")
             return
 
         # TP1: +15% 止盈50%
@@ -567,7 +588,7 @@ class TrendEngine:
             self.ex.market_sell(self.symbol, qty)
             pnl = (price - self.entry_price) / self.entry_price * 100
             log(f"[趋势卖出] {self.symbol}@{price:.4f}({pnl:+.2f}%) {reason}")
-            if reason in ('SL', 'TS') and self.sm:
+            if reason in ('SL', 'TS', 'TREND_BREAK') and self.sm:
                 self.sm.record_loss()
             elif reason.startswith('TP') and self.sm:
                 self.sm.record_win()
