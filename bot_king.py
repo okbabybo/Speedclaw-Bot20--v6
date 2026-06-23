@@ -115,7 +115,7 @@ def get_phase1_grids(balance):
     if balance < 300:  return 2
     return 2
 class GridEngine:
-    def __init__(self, symbol, entry_price, grids, grid_profit, atr, ex, capital, phase1_limit=2):
+    def __init__(self, symbol, entry_price, grids, grid_profit, atr, ex, capital, phase1_limit=2, sm=None):
         self.symbol = symbol
         self.entry_price = entry_price
         self.max_grids = grids
@@ -124,6 +124,7 @@ class GridEngine:
         self.ex = ex
         self.capital = capital
         self.phase1_limit = phase1_limit
+        self.sm = sm           # StateManager引用（用于record_loss）
         self.pending_profit = 0
         self.last_tp_time = 0
         self._open_count = 0
@@ -134,6 +135,7 @@ class GridEngine:
         self.grid_width = (self.upper - self.lower) / self.max_grids if self.max_grids > 0 else grid_range
         self.positions = {}
         self.position = {'symbol': symbol, 'qty': 0, 'entry': entry_price}
+        self._all_sold = False  # 标记所有格都已平仓
 
     def get_grid_index(self, price):
         if price <= self.lower: return 0
@@ -148,6 +150,9 @@ class GridEngine:
         return min(per_grid_max, base / (self.max_grids - active))
 
     def buy_grid(self, idx, price, locked_profit=0):
+        # 防止重复开仓（race condition保护）
+        if idx in self.positions and not self.positions[idx].get('sold'):
+            return False
         invest = self.invest_per_grid(locked_profit)
         if invest < 11: return False
         qty = self._round_qty(invest / price)
@@ -172,11 +177,16 @@ class GridEngine:
         return False
 
     def check_phased_open(self, cur_price):
+        """分批开仓：Phase1→Phase2，Phase2由止盈利润触发"""
         now = time.time()
         if self._open_count >= self.max_grids: return
+        # Phase2必须有止盈利润才能开
         if self.pending_profit <= 0: return
+        # 止盈后必须等PHASE2_DELAY秒
         if now - self.last_tp_time < PHASE2_DELAY: return
-        if self._open_count >= self.phase1_limit: return
+        # Phase1未满时继续开Phase1（不用pending_profit）
+        if self._open_count < self.phase1_limit: return
+        # Phase1已满，开Phase2（用止盈利润开）
         for idx in range(self.max_grids):
             if idx not in self.positions:
                 self.buy_grid(idx, cur_price, locked_profit=self.pending_profit)
@@ -235,7 +245,17 @@ class GridEngine:
                 pos['sold_price'] = cur_price
                 pos['sold_at'] = time.time()
                 self.position['qty'] = max(0, self.position['qty'] - qty)
-                if reason.startswith('TP'):
+
+                # 检查是否所有格都平了
+                if all(p.get('sold') for p in self.positions.values()):
+                    self._all_sold = True
+
+                if reason in ('SL', 'TS'):
+                    # 止损/追踪止损 → 记录亏损、触发冷静期
+                    if self.sm: self.sm.record_loss()
+                elif reason.startswith('TP'):
+                    # 止盈 → 记录胜利、分配利润
+                    if self.sm: self.sm.record_win()
                     locked = profit * PROFIT_LOCK
                     reinvest = profit * (1 - PROFIT_LOCK)
                     self.pending_profit += reinvest
@@ -251,18 +271,25 @@ class GridEngine:
         return any(not p.get('sold') and p['qty'] > 0 for p in self.positions.values())
 
     def detect_manual_close(self, api_qty):
-        for idx, pos in list(self.positions.items()):
-            if pos.get('sold') or pos['qty'] <= 0: continue
-            if api_qty <= 0:
-                log(f"[⚠️ 手动平仓] {self.symbol}格{idx}@{pos['buy_price']:.4f}")
+        """检测手动平仓（支持部分平仓检测）"""
+        # 计算状态文件中该币的总持仓
+        total_state_qty = sum(pos['qty'] for pos in self.positions.values()
+                             if not pos.get('sold') and pos['qty'] > 0)
+        # 如果API持仓 < 状态持仓，说明用户手动卖出了一部分
+        if api_qty < total_state_qty - 0.00001:  # 允许微小误差
+            for idx, pos in list(self.positions.items()):
+                if pos.get('sold') or pos['qty'] <= 0: continue
+                log(f"[⚠️ 手动平仓] {self.symbol}格{idx}@{pos['buy_price']:.4f} "
+                    f"(API仅剩{api_qty})")
                 pos['sold'] = True
                 pos['sold_at'] = time.time()
 
 # ===================== 趋势引擎 =====================
 class TrendEngine:
-    def __init__(self, symbol, ex):
+    def __init__(self, symbol, ex, sm=None):
         self.symbol = symbol
         self.ex = ex
+        self.sm = sm           # StateManager引用
         self.position = None
         self.entry_price = 0
         self.ts_triggered = False
@@ -322,6 +349,10 @@ class TrendEngine:
             self.ex.market_sell(self.symbol, qty)
             pnl = (price - self.entry_price) / self.entry_price * 100
             log(f"[趋势卖出] {self.symbol}@{price:.4f}({pnl:+.2f}%) {reason}")
+            if reason in ('SL', 'TS') and self.sm:
+                self.sm.record_loss()
+            elif reason.startswith('TP') and self.sm:
+                self.sm.record_win()
             self.position = None
         except: pass
 
@@ -407,6 +438,24 @@ class StateManager:
             self.lock_until = time.time() + 1800
             self.save()
             return False
+        return True
+
+    def check_daily_loss(self, balance):
+        """日亏保护：单日亏损>8%暂停1小时，UTC0点重置"""
+        now = time.time()
+        # UTC0点重置
+        if self.daily_reset_time == 0 or (now - self.daily_reset_time) >= 86400:
+            self.daily_loss = 0
+            self.daily_reset_time = now
+            self.save()
+            return True
+        if self.high_water > 0:
+            daily_pnl = (balance - self.high_water) / self.high_water
+            if daily_pnl < -MAX_DAILY_LOSS:
+                log(f"[⚠️ 日亏保护] 单日亏损{abs(daily_pnl)*100:.1f}% > {MAX_DAILY_LOSS*100:.0f}%，暂停1小时")
+                self.lock_until = time.time() + 3600
+                self.save()
+                return False
         return True
 
     def check_take_profit(self, balance):
@@ -510,6 +559,11 @@ def main():
             time.sleep(30)
             continue
 
+        # === 日亏保护 ===
+        if not sm.check_daily_loss(balance):
+            time.sleep(30)
+            continue
+
         # === 市场扫描（每3分钟）===
         if now - last_scan >= SCAN_INTERVAL:
             last_scan = now
@@ -533,13 +587,23 @@ def main():
             btc_mode = signals.get('BTCUSDT', {}).get('mode', 'RANGE_BOUND')
             sm.market_mode = btc_mode
 
-            # === 排序买信号 ===
+            # === 清理死引擎（所有格都平了）=== Bug #2 fix
+            for sym in list(grid_engines.keys()):
+                if grid_engines[sym]._all_sold:
+                    log(f"[引擎清理] {sym} 所有格已平，移除引擎")
+                    del grid_engines[sym]
+            for sym in list(trend_engines.keys()):
+                if trend_engines[sym].position is None:
+                    del trend_engines[sym]
+
+            # === 排序买信号（排除已有活跃仓位的币）===
             active_total = len(grid_engines) + len([e for e in trend_engines.values() if e.position])
             investable = balance
 
             buy_list = sorted(
                 [(s, i) for s, i in signals.items()
-                 if s not in grid_engines and s not in trend_engines
+                 if (s not in grid_engines or grid_engines.get(s, {})._all_sold)
+                 and (s not in trend_engines or trend_engines.get(s, {}).position is None)
                  and (i['mode'] in ("TREND_UP", "VOLATILE_OVERSOLD")
                       or (i['mode'] == "RANGE_BOUND" and i.get('total_score', 0) > 0.5))
                  and i.get('price', 0) > 0],
@@ -557,7 +621,7 @@ def main():
 
                 per_coin = calc_position_size(investable, max(active_total, 1), info)
                 if info['trend_bias'] >= 0.7:
-                    eng = TrendEngine(sym, ex)
+                    eng = TrendEngine(sym, ex, sm=sm)
                     if eng.buy(info['price'], per_coin / info['price']):
                         trend_engines[sym] = eng
                         investable -= per_coin
@@ -567,7 +631,7 @@ def main():
                     phase1 = get_phase1_grids(balance)
                     eng = GridEngine(sym, info['price'], info['grids'],
                                     info['grid_profit'], info.get('atr', 0), ex, per_coin,
-                                    phase1_limit=phase1)
+                                    phase1_limit=phase1, sm=sm)
                     grid_engines[sym] = eng
                     investable -= per_coin
                     active_total += 1
