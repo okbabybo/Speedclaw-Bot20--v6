@@ -62,6 +62,12 @@ SCAN_INTERVAL  = 180
 SAVE_INTERVAL  = 60
 MAX_POSITIONS  = 3
 
+# === 市场宏观过滤 ===
+FEAR_GREED_URL = "https://api.alternative.me/fng/"
+FEAR_GREED_COOLDOWN = 3600  # Fear/Greed数据每小时更新，缓存1小时
+_last_fear_greed = 75  # 默认中立
+_last_fg_fetch = 0
+
 # 指标
 RSI_PERIOD = 14
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
@@ -132,6 +138,29 @@ def get_phase1_grids(balance):
     if balance < 100:  return 1
     if balance < 300:  return 2
     return 2
+
+def get_fear_greed():
+    """获取Fear & Greed指数（0-100），0=极度恐慌，100=极度贪婪"""
+    global _last_fear_greed, _last_fg_fetch
+    now = time.time()
+    if now - _last_fg_fetch < FEAR_GREED_COOLDOWN:
+        return _last_fear_greed
+    try:
+        r = requests.get(FEAR_GREED_URL, timeout=5)
+        data = r.json().get('data', [{}])[0]
+        _last_fear_greed = int(data.get('value', 50))
+        _last_fg_fetch = now
+        log(f"[宏观] Fear & Greed: {_last_fear_greed} ({data.get('value_classification','')})")
+    except:
+        log(f"[宏观] Fear & Greed获取失败，使用默认值50")
+    return _last_fear_greed
+
+def is_extreme_hour():
+    """北京时间22:00-02:00为流动性极差的极端时段，禁止开仓"""
+    from datetime import datetime
+    h = datetime.utcfromtimestamp(time.time()).hour  # UTC小时
+    # 北京时间 = UTC+8，所以北京时间22:00-02:00 = UTC14:00-18:00
+    return 14 <= h <= 18
 
 # ===================== 市场模式检测 =====================
 def detect_market_mode(symbol, ex):
@@ -207,9 +236,15 @@ def detect_market_mode(symbol, ex):
     elif atr_pct > 0.02: atr_grids, atr_gp = ATR_GRID_MAP['medium']
     else:                   atr_grids, atr_gp = ATR_GRID_MAP['low']
 
+    # Fear & Greed宏观过滤
+    fg = get_fear_greed()
+
+    # 交易量确认（当前成交量应>均量70%以上才有意义）
+    vol_valid = vol_ratio > 0.7
+
     # === 模式判断（带置信度）===
     mode = "RANGE_BOUND"
-    confidence = 0.5  # 默认置信度50%
+    confidence = 0.5
 
     # 1. 极端行情（最高优先级）
     if rsi_d1 > 80 or rsi_d1 < 20:
@@ -223,32 +258,55 @@ def detect_market_mode(symbol, ex):
     elif adx_avg > 25 and trend_down_4h and trend_down_1h and rsi_1h < 50:
         mode = "TREND_DOWN"
         confidence = min(0.95, 0.6 + (adx_avg - 25) / 75)
-    # 4. 高波动超卖（RSI背离加分）
+    # 4. 趋势中继整理（在强趋势中回调，视为机会而非风险）
+    #    条件：ADX>20 + 任意EMA同向 + RSI极端回调（<40或>60）
+    #    例：上涨趋势中RSI回调到35 = 买入机会，不是转势
+    elif adx_avg > 20 and (trend_up_4h or trend_up_d1):
+        if rsi_1h < 35 and rsi_bullish_div:
+            mode = "TREND_UP_RECALL"  # 趋势回调，是买入机会
+            confidence = 0.75
+        elif rsi_1h < 40 and vol_valid:
+            mode = "TREND_UP_RECALL"
+            confidence = 0.65
+    # 5. 高波动超卖（RSI背离加分）
     elif is_volatile and rsi_1h < 35 and (vol_surge or rsi_bullish_div):
         mode = "VOLATILE_OVERSOLD"
         confidence = 0.7 + 0.1 * int(rsi_bullish_div) + 0.1 * int(vol_surge)
-    # 5. 高波动超买
+    # 6. 高波动超买
     elif is_volatile and rsi_1h > 65 and vol_surge:
         mode = "VOLATILE_OVERBOUGHT"
         confidence = 0.8
-    # 6. 弱趋势/震荡（ADX<20时更确认震荡）
+    # 7. 弱趋势/震荡（ADX<20时更确认震荡）
     elif adx_avg < 20:
         mode = "RANGE_BOUND"
-        confidence = 0.8 - 0.1 * int(not trend_up_1h and not trend_down_1h)
-    # 7. 普通震荡
+        confidence = 0.8
+    # 8. 普通震荡
     else:
         mode = "RANGE_BOUND"
         confidence = 0.6
 
-    # === 模式参数 ===
-    base_params = {
+    # Fear & Greed调整置信度（极度恐慌时超卖信号更可信）
+    if fg < 25 and mode in ("VOLATILE_OVERSOLD", "TREND_UP_RECALL"):
+        confidence = min(0.98, confidence + 0.15)
+        log(f"[Fear & Greed] 极度恐慌{fg}，超卖信号置信度提升")
+    elif fg > 75 and mode in ("VOLATILE_OVERBOUGHT", "CRISIS"):
+        confidence = min(0.98, confidence + 0.1)
+
+    # 交易量无效时降低置信度
+    if not vol_valid and mode in ("VOLATILE_OVERSOLD", "VOLATILE_OVERBOUGHT"):
+        confidence *= 0.7
+
+    # === 模式参数（趋势回调等同于TREND_UP）===
+    _mode_params = {
         "TREND_UP":            {"pos_pct": 1.0,  "grids": 2, "grid_profit": GRID_PROFIT,      "trend_bias": 1.0},
+        "TREND_UP_RECALL":     {"pos_pct": 1.0,  "grids": 2, "grid_profit": GRID_PROFIT,      "trend_bias": 0.9},  # 回调买入按趋势做
         "TREND_DOWN":          {"pos_pct": 0.3,  "grids": 2, "grid_profit": GRID_PROFIT,      "trend_bias": 0.0},
         "RANGE_BOUND":         {"pos_pct": 0.8,  "grids": atr_grids, "grid_profit": atr_gp,  "trend_bias": 0.3},
         "VOLATILE_OVERSOLD":   {"pos_pct": 1.2,  "grids": min(atr_grids, 4), "grid_profit": atr_gp, "trend_bias": 0.7},
         "VOLATILE_OVERBOUGHT": {"pos_pct": 0.0,  "grids": 0, "grid_profit": atr_gp,          "trend_bias": 0.0},
         "CRISIS":              {"pos_pct": 0.0,  "grids": 0, "grid_profit": atr_gp,          "trend_bias": 0.0},
-    }[mode]
+    }
+    base_params = _mode_params[mode]
 
     # === 综合评分（决定买入优先级，置信度加权）===
     grid_score   = max(0, (60 - rsi_1h) / 60)
@@ -270,6 +328,8 @@ def detect_market_mode(symbol, ex):
         'total_score': total_score,
         'pos_pct': base_params['pos_pct'],
         'rsi_bullish_div': rsi_bullish_div,
+        'vol_ratio': vol_ratio,
+        'fear_greed': fg,
     }
 
 class GridEngine:
@@ -739,12 +799,14 @@ def main():
                     elif mode in ("TREND_UP", "VOLATILE_OVERSOLD"): se = sig_emoji["BUY"]
                     conf = info.get('confidence', 0)
                     adx  = info.get('adx', 0)
+                    fg   = info.get('fear_greed', 50)
                     div  = '📈' if info.get('rsi_bullish_div') else ''
                     conf_str = f"{conf:.0%}"
-                    log(f"  {me}{se} {sym:10s} ${info.get('price',0):12.4f} | RSI={info.get('rsi',0):5.1f} ADX={adx:4.0f} | {conf_str} | {mode:20s} | G={info.get('grids',0):1.0f} T={info.get('trend_bias',0):.1f} {div}")
+                    fg_str = f"FG{fg:3.0f}"
+                    log(f"  {me}{se} {sym:10s} ${info.get('price',0):12.4f} | RSI={info.get('rsi',0):5.1f} ADX={adx:4.0f} | {fg_str} | {conf_str} | {mode:20s} | G={info.get('grids',0):1.0f} {div}")
                 except Exception as e:
                     log(f"[扫描异常] {sym}: {e} ({type(e).__name__})")
-                    signals[sym] = {'price': 0, 'rsi': 50, 'mode': 'RANGE_BOUND', 'grids': 0, 'trend_bias': 0, 'confidence': 0, 'adx': 0}
+                    signals[sym] = {'price': 0, 'rsi': 50, 'mode': 'RANGE_BOUND', 'grids': 0, 'trend_bias': 0, 'confidence': 0, 'adx': 0, 'fear_greed': 50, 'vol_ratio': 1}
 
             # 更新全局市场模式
             btc_mode = signals.get('BTCUSDT', {}).get('mode', 'RANGE_BOUND')
@@ -759,16 +821,18 @@ def main():
                 if trend_engines[sym].position is None:
                     del trend_engines[sym]
 
-            # === 排序买信号（排除已有活跃仓位的币）===
-            active_total = len(grid_engines) + len([e for e in trend_engines.values() if e.position])
-            investable = balance
+            # === 极端时段过滤（北京时间22:00-02:00禁止开仓）===
+            if is_extreme_hour():
+                if buy_list:
+                    log(f"[⏰极端时段] 北京时间22:00-02:00，暂停开仓，等待流动性恢复")
+                buy_list = []
 
             buy_list = sorted(
                 [(s, i) for s, i in signals.items()
                  if (s not in grid_engines or grid_engines.get(s, {})._all_sold)
                  and (s not in trend_engines or trend_engines.get(s, {}).position is None)
-                 and i.get('confidence', 0) >= 0.6   # 置信度>60%才买入
-                 and (i['mode'] in ("TREND_UP", "VOLATILE_OVERSOLD")
+                 and i.get('confidence', 0) >= 0.6
+                 and (i['mode'] in ("TREND_UP", "TREND_UP_RECALL", "VOLATILE_OVERSOLD")
                       or (i['mode'] == "RANGE_BOUND" and i.get('total_score', 0) > 0.5))
                  and i.get('price', 0) > 0],
                 key=lambda x: x[1].get('total_score', 0),
