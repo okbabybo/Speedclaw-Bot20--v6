@@ -110,10 +110,168 @@ def calc_atr(klines, period=14):
     if len(trs) < period: return 0
     return sum(trs[-period:]) / period
 
+def calc_adx(klines, period=14):
+    """计算ADX趋势强度指标（ADX>25=强趋势，<20=震荡）"""
+    if not klines or len(klines) < period+2: return 20
+    pdm, mdm, trs = [], [], []
+    for i in range(1, len(klines)):
+        h, l, c = float(klines[i][2]), float(klines[i][3]), float(klines[i][4])
+        ph, pl = float(klines[i-1][2]), float(klines[i-1][3])
+        up = h - ph; dn = pl - l
+        pdm.append(max(up, dn) if up > dn else 0)
+        mdm.append(max(dn, up) if dn > up else 0)
+        tr = max(h-l, abs(h-c), abs(l-c))
+        trs.append(tr)
+    if len(trs) < period: return 20
+    pdi = sum(pdm[-period:]) / sum(trs[-period:]) * 100 if sum(trs[-period:]) > 0 else 0
+    mdi = sum(mdm[-period:]) / sum(trs[-period:]) * 100 if sum(trs[-period:]) > 0 else 0
+    dx = abs(pdi - mdi) / (pdi + mdi) * 100 if (pdi + mdi) > 0 else 0
+    return min(dx, 100)  # ADX范围0-100
+
 def get_phase1_grids(balance):
     if balance < 100:  return 1
     if balance < 300:  return 2
     return 2
+
+# ===================== 市场模式检测 =====================
+def detect_market_mode(symbol, ex):
+    """检测6种市场模式（多周期确认 + ADX趋势强度），返回(mode, info字典)"""
+    c15m = ex.get_klines(symbol, "15m", 60)   # 15分钟辅助确认
+    c1h  = ex.get_klines(symbol, "1h",  60)
+    c4h  = ex.get_klines(symbol, "4h",  100)
+    c1d  = ex.get_klines(symbol, "1d",  50)
+
+    if not (c1h and c4h and c1d):
+        return "RANGE_BOUND", {'price': 0, 'rsi': 50, 'mode': 'RANGE_BOUND',
+                               'grids': 4, 'grid_profit': GRID_PROFIT, 'atr': 0,
+                               'trend_bias': 0.3, 'confidence': 0}
+
+    closes_15m = [float(k[4]) for k in c15m] if c15m else []
+    closes_1h = [float(k[4]) for k in c1h]
+    closes_4h = [float(k[4]) for k in c4h]
+    closes_1d = [float(k[4]) for k in c1d]
+    cur = closes_1h[-1]
+    if cur <= 0:
+        return "RANGE_BOUND", {'price': 0, 'rsi': 50, 'mode': 'RANGE_BOUND',
+                               'grids': 4, 'grid_profit': GRID_PROFIT, 'atr': 0,
+                               'trend_bias': 0.3, 'confidence': 0}
+
+    rsi_15m = calc_rsi(closes_15m) if closes_15m else 50
+    rsi_1h  = calc_rsi(closes_1h)
+    rsi_d1  = calc_rsi(closes_1d)
+
+    ema20_15m = calc_ema(closes_15m, 20) if closes_15m else None
+    ema20_1h  = calc_ema(closes_1h, 20)
+    ema20_4h  = calc_ema(closes_4h, 20)
+    ema20_1d  = calc_ema(closes_1d, 20)
+
+    # ADX趋势强度
+    adx_1h = calc_adx(c1h)
+    adx_4h = calc_adx(c4h)
+    adx_avg = (adx_1h + adx_4h) / 2
+
+    # 趋势方向（明确：价格必须在EMA以上才算向上）
+    trend_up_15m = ema20_15m is not None and closes_15m[-1] > ema20_15m
+    trend_up_1h  = ema20_1h  is not None and cur > ema20_1h
+    trend_up_4h  = ema20_4h  is not None and closes_4h[-1] > ema20_4h
+    trend_up_d1  = ema20_1d  is not None and closes_1d[-1] > ema20_1d
+
+    trend_down_15m = ema20_15m is not None and closes_15m[-1] < ema20_15m
+    trend_down_1h  = ema20_1h  is not None and cur < ema20_1h
+    trend_down_4h  = ema20_4h  is not None and closes_4h[-1] < ema20_4h
+    trend_down_d1  = ema20_1d  is not None and closes_1d[-1] < ema20_1d
+
+    macd, _, macd_sig = calc_macd(closes_1h)
+
+    # RSI背离检测（价格创新低但RSI没创新低 = 底背离 = 反弹信号）
+    rsi_bullish_div = False
+    if len(closes_1h) >= 20:
+        price_slope = closes_1h[-1] - closes_1h[-20]
+        rsi_slope   = rsi_1h - calc_rsi(closes_1h[:-10]) if len(closes_1h) >= 30 else 0
+        rsi_bullish_div = price_slope < -0.02 * cur and rsi_slope > 2  # 价格跌但RSI没跟随大跌
+
+    # 成交量爆发
+    vol_cur = float(c1h[-1][5]) if c1h else 0
+    vol_avg = sum(float(k[5]) for k in c1h[-30:]) / 30 if c1h else 1
+    vol_ratio = vol_cur / vol_avg if vol_avg > 0 else 1
+    vol_surge = vol_ratio > 1.3
+
+    # 波幅
+    price_range = (max(closes_1h) - min(closes_1h)) / cur
+    is_volatile = price_range > 0.08
+
+    # ATR
+    atr = calc_atr(c1h)
+    atr_pct = atr / cur
+    if atr_pct > 0.05:   atr_grids, atr_gp = ATR_GRID_MAP['high']
+    elif atr_pct > 0.02: atr_grids, atr_gp = ATR_GRID_MAP['medium']
+    else:                   atr_grids, atr_gp = ATR_GRID_MAP['low']
+
+    # === 模式判断（带置信度）===
+    mode = "RANGE_BOUND"
+    confidence = 0.5  # 默认置信度50%
+
+    # 1. 极端行情（最高优先级）
+    if rsi_d1 > 80 or rsi_d1 < 20:
+        mode = "CRISIS"
+        confidence = 0.95
+    # 2. 强上升趋势（ADX>25 + 三周期同向上 + MACD正向）
+    elif adx_avg > 25 and trend_up_d1 and trend_up_4h and trend_up_1h:
+        mode = "TREND_UP"
+        confidence = min(0.95, 0.6 + (adx_avg - 25) / 75 + 0.1 * int(macd > macd_sig))
+    # 3. 强下跌趋势（ADX>25 + 4H+1H向下 + RSI<50）
+    elif adx_avg > 25 and trend_down_4h and trend_down_1h and rsi_1h < 50:
+        mode = "TREND_DOWN"
+        confidence = min(0.95, 0.6 + (adx_avg - 25) / 75)
+    # 4. 高波动超卖（RSI背离加分）
+    elif is_volatile and rsi_1h < 35 and (vol_surge or rsi_bullish_div):
+        mode = "VOLATILE_OVERSOLD"
+        confidence = 0.7 + 0.1 * int(rsi_bullish_div) + 0.1 * int(vol_surge)
+    # 5. 高波动超买
+    elif is_volatile and rsi_1h > 65 and vol_surge:
+        mode = "VOLATILE_OVERBOUGHT"
+        confidence = 0.8
+    # 6. 弱趋势/震荡（ADX<20时更确认震荡）
+    elif adx_avg < 20:
+        mode = "RANGE_BOUND"
+        confidence = 0.8 - 0.1 * int(not trend_up_1h and not trend_down_1h)
+    # 7. 普通震荡
+    else:
+        mode = "RANGE_BOUND"
+        confidence = 0.6
+
+    # === 模式参数 ===
+    base_params = {
+        "TREND_UP":            {"pos_pct": 1.0,  "grids": 2, "grid_profit": GRID_PROFIT,      "trend_bias": 1.0},
+        "TREND_DOWN":          {"pos_pct": 0.3,  "grids": 2, "grid_profit": GRID_PROFIT,      "trend_bias": 0.0},
+        "RANGE_BOUND":         {"pos_pct": 0.8,  "grids": atr_grids, "grid_profit": atr_gp,  "trend_bias": 0.3},
+        "VOLATILE_OVERSOLD":   {"pos_pct": 1.2,  "grids": min(atr_grids, 4), "grid_profit": atr_gp, "trend_bias": 0.7},
+        "VOLATILE_OVERBOUGHT": {"pos_pct": 0.0,  "grids": 0, "grid_profit": atr_gp,          "trend_bias": 0.0},
+        "CRISIS":              {"pos_pct": 0.0,  "grids": 0, "grid_profit": atr_gp,          "trend_bias": 0.0},
+    }[mode]
+
+    # === 综合评分（决定买入优先级，置信度加权）===
+    grid_score   = max(0, (60 - rsi_1h) / 60)
+    trend_score  = max(0, (rsi_1h - 40) / 40)
+    total_score  = (grid_score + trend_score * base_params['trend_bias']) * confidence
+    if macd > macd_sig: total_score *= 1.1  # MACD柱在信号线上方
+
+    return mode, {
+        'price': cur,
+        'rsi': rsi_1h,
+        'rsi_15m': rsi_15m,
+        'adx': adx_avg,
+        'mode': mode,
+        'confidence': confidence,
+        'grids': base_params['grids'],
+        'grid_profit': base_params['grid_profit'],
+        'atr': atr,
+        'trend_bias': base_params['trend_bias'],
+        'total_score': total_score,
+        'pos_pct': base_params['pos_pct'],
+        'rsi_bullish_div': rsi_bullish_div,
+    }
+
 class GridEngine:
     def __init__(self, symbol, entry_price, grids, grid_profit, atr, ex, capital, phase1_limit=2, sm=None):
         self.symbol = symbol
@@ -579,9 +737,14 @@ def main():
                     se = sig_emoji.get("HOLD", "⚪")
                     if mode in ("VOLATILE_OVERBOUGHT", "CRISIS"): se = sig_emoji["SELL"]
                     elif mode in ("TREND_UP", "VOLATILE_OVERSOLD"): se = sig_emoji["BUY"]
-                    log(f"  {me}{se} {sym:10s} ${info.get('price',0):12.4f} | RSI={info.get('rsi',0):5.1f} | {mode:20s} | G={info.get('grids',0):1.0f} T={info.get('trend_bias',0):.1f}")
-                except:
-                    signals[sym] = {'price': 0, 'rsi': 50, 'mode': 'RANGE_BOUND', 'grids': 0, 'trend_bias': 0}
+                    conf = info.get('confidence', 0)
+                    adx  = info.get('adx', 0)
+                    div  = '📈' if info.get('rsi_bullish_div') else ''
+                    conf_str = f"{conf:.0%}"
+                    log(f"  {me}{se} {sym:10s} ${info.get('price',0):12.4f} | RSI={info.get('rsi',0):5.1f} ADX={adx:4.0f} | {conf_str} | {mode:20s} | G={info.get('grids',0):1.0f} T={info.get('trend_bias',0):.1f} {div}")
+                except Exception as e:
+                    log(f"[扫描异常] {sym}: {e} ({type(e).__name__})")
+                    signals[sym] = {'price': 0, 'rsi': 50, 'mode': 'RANGE_BOUND', 'grids': 0, 'trend_bias': 0, 'confidence': 0, 'adx': 0}
 
             # 更新全局市场模式
             btc_mode = signals.get('BTCUSDT', {}).get('mode', 'RANGE_BOUND')
@@ -604,6 +767,7 @@ def main():
                 [(s, i) for s, i in signals.items()
                  if (s not in grid_engines or grid_engines.get(s, {})._all_sold)
                  and (s not in trend_engines or trend_engines.get(s, {}).position is None)
+                 and i.get('confidence', 0) >= 0.6   # 置信度>60%才买入
                  and (i['mode'] in ("TREND_UP", "VOLATILE_OVERSOLD")
                       or (i['mode'] == "RANGE_BOUND" and i.get('total_score', 0) > 0.5))
                  and i.get('price', 0) > 0],
