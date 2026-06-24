@@ -377,6 +377,9 @@ def get_signal(symbol):
     # StochRSI（捕捉中性区机会）
     sk15, sd15 = calc_stoch_rsi(c15m, 14, 3, 3)
     sk1, sd1 = calc_stoch_rsi(c1h, 14, 3, 3)
+    # None保护：所有sk15/sk1比较统一用sk15_v/sk1_v
+    sk15_v = sk15 if sk15 is not None else 50
+    sk1_v = sk1 if sk1 is not None else 50
     
     atr = calc_atr(k15m, 14)
     vr = v15m[-1] / (sum(v15m[-20:])/20) if len(v15m) >= 20 else 1
@@ -463,8 +466,8 @@ def get_signal(symbol):
         if cur < ema1h_20 * 0.995: ct_score += 1.5; ct_reasons.append(f"偏离EMA>{0.5:.1f}%")
         elif cur < ema1h_20 * 0.99: ct_score += 1; ct_reasons.append(f"偏离EMA>{1.0:.1f}%")
         # StochRSI极端
-        if sk15 < 20: ct_score += 2; ct_reasons.append(f"Stoch15={sk15:.0f}<20")
-        if sk1 < 20: ct_score += 1; ct_reasons.append(f"Stoch1={sk1:.0f}<20")
+        if sk15_v < 20: ct_score += 2; ct_reasons.append(f"Stoch15={sk15_v:.0f}<20")
+        if sk1_v < 20: ct_score += 1; ct_reasons.append(f"Stoch1={sk1_v:.0f}<20")
         # 底背加分
         if div_bull: ct_score += 1.5; ct_reasons.append("底背")
         if ct_score >= 6.5:
@@ -479,8 +482,8 @@ def get_signal(symbol):
         # 价格偏离（放宽到0.5%以上即可）
         if cur > ema1h_20 * 1.005: ct_score += 1.5; ct_reasons.append(f"偏离EMA>{0.5:.1f}%")
         elif cur > ema1h_20 * 1.01: ct_score += 1; ct_reasons.append(f"偏离EMA>{1.0:.1f}%")
-        if sk15 > 80: ct_score += 2; ct_reasons.append(f"Stoch15={sk15:.0f}>80")
-        if sk1 > 80: ct_score += 1; ct_reasons.append(f"Stoch1={sk1:.0f}>80")
+        if sk15_v > 80: ct_score += 2; ct_reasons.append(f"Stoch15={sk15_v:.0f}>80")
+        if sk1_v > 80: ct_score += 1; ct_reasons.append(f"Stoch1={sk1_v:.0f}>80")
         if div_bear: ct_score += 1.5; ct_reasons.append("顶背")
         if ct_score >= 6.5:
             counter_trend_sig = "SHORT"; counter_trend_reasons = ct_reasons
@@ -502,11 +505,11 @@ def get_signal(symbol):
     if trend_up: long_score += 1; long_reasons.append("趋势↑" + (" [共振]" if STRONG_TREND_MODE else ""))
     
     # StochRSI EMA平滑（减少噪音）
-    if sk15 < 20: long_score += 2; long_reasons.append(f"StochK15={sk15:.0f}<20")
-    if sk1 < 20: long_score += 1; long_reasons.append(f"StochK1={sk1:.0f}<20")
+    if sk15_v < 20: long_score += 2; long_reasons.append(f"StochK15={sk15_v:.0f}<20")
+    if sk1_v < 20: long_score += 1; long_reasons.append(f"StochK1={sk1_v:.0f}<20")
     
     # 放宽区(40-{long_rsi_thresh})必须有StochRSI极端值才能触发
-    stoich_extreme = sk15 < 20 or sk1 < 20
+    stoich_extreme = sk15_v < 20 or sk1_v < 20
     if 40 <= r1 < long_rsi_thresh and not stoich_extreme:
         long_score -= 0.5; long_reasons.append("放宽区无Stoch极端-0.5")
     
@@ -546,11 +549,11 @@ def get_signal(symbol):
         short_score += 0.5; short_reasons.append(f"R1={r1:.0f} [趋势跟随]")
     
     # StochRSI EMA平滑（减少噪音）
-    if sk15 > 80: short_score += 2; short_reasons.append(f"StochK15={sk15:.0f}>80")
-    if sk1 > 80: short_score += 1; short_reasons.append(f"StochK1={sk1:.0f}>80")
+    if sk15_v > 80: short_score += 2; short_reasons.append(f"StochK15={sk15_v:.0f}>80")
+    if sk1_v > 80: short_score += 1; short_reasons.append(f"StochK1={sk1_v:.0f}>80")
     
     # 放宽区必须有StochRSI极端值才能触发
-    stoich_extreme_short = sk15 > 80 or sk1 > 80
+    stoich_extreme_short = sk15_v > 80 or sk1_v > 80
     if 30 < r1 <= 40 and not stoich_extreme_short:
         short_score -= 0.5; short_reasons.append("放宽区无Stoch极端-0.5")
     
@@ -894,7 +897,7 @@ def main():
                         
                         if d == "LONG":
                             pnl = (cur - entry) / entry * 100
-                            best_high = max(s.get("best", entry), cur)
+                            best_high = max(s.get("best") if s.get("best") is not None else entry, cur)
                             s["best"] = best_high
                             
                             tp1_price = entry * (1 + TP1_PCT)
@@ -920,7 +923,7 @@ def main():
                             
                         else:
                             pnl = (entry - cur) / entry * 100
-                            best_low = min(s.get("best", entry), cur)
+                            best_low = min(s.get("best") if s.get("best") is not None else entry, cur)
                             s["best"] = best_low
                             
                             tp1_price = entry * (1 - TP1_PCT)
