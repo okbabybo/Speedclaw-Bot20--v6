@@ -766,6 +766,12 @@ def main():
                 info = get_signal(symbol)
                 if info is None:
                     time.sleep(15); continue
+                # v5.7 防御性字段处理 - 防止字段为None崩溃 (修复112次重启Bug)
+                for _k, _v in {'sig': None, 'long_ready': False, 'short_ready': False,
+                                'trend_up': False, 'trend_reasons': 'N/A', 'r1': 99, 'r4': 99,
+                                'r15': 50, 'sk15': 50, 'vr': 1.0, 'atr': 0, 'cur': 0,
+                                'reasons': [], 'trend4h_price': True}.items():
+                    if info.get(_k) is None: info[_k] = _v
                 positions = get_all_positions(symbol)
                 
                 # === v5.2 新增：趋势反转预警 ===
