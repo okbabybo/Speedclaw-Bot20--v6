@@ -13,3 +13,4 @@ config_*.yaml
 # 临时文件
 *.log
 *.tmp
+.env

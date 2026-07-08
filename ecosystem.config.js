@@ -39,6 +39,12 @@ module.exports = {
       env: {
         NODE_ENV: 'production',
         BOT_NAME: 'bot20x',
+        // v6.0: API 凭证从环境变量读入（不再硬编码在代码里）
+        // 生产环境从 .env 文件加载，或 PM2 启动时手动 export
+        BINANCE_API_KEY: process.env.BINANCE_API_KEY || '',
+        BINANCE_API_SECRET: process.env.BINANCE_API_SECRET || '',
+        TELEGRAM_TOKEN: process.env.TELEGRAM_TOKEN || '',
+        OWNER_TELEGRAM_ID: process.env.OWNER_TELEGRAM_ID || '',
       },
     },
     {
