@@ -215,6 +215,36 @@ TRAIL_DISTANCE = 0.008            # 追踪距离0.8%（ATR动态SL补充）
 # === v_smart_v3: 手续费/滑点补偿 ===
 EXPECTED_FEE_PCT = 0.0016         # 20x下单双边手续费+滑点 总名义成本约0.16%
 
+# === v3.1: Telegram统一发送函数(防API故障静默丢失) ===
+TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN', '8734542487:AAEtrTM24xCdjyB2MYj8DNp0R4xuLMCOJEc')
+TG_OWNER_CHAT = os.environ.get('TG_OWNER_CHAT', '7204010604')
+TG_SEND_TIMEOUT = 5              # Telegram推送超时
+
+def tg_send(msg, parse_mode='HTML'):
+    """统一Telegram发送(带重试+超时+失败告警)
+    用于启动通知/心趵报告/异常报警
+    """
+    for attempt in range(3):
+        try:
+            url = f'https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage'
+            r = requests.post(url, json={
+                'chat_id': TG_OWNER_CHAT,
+                'text': msg,
+                'parse_mode': parse_mode,
+            }, timeout=TG_SEND_TIMEOUT)
+            if r.status_code == 200:
+                return True
+            elif r.status_code in (401, 403):
+                log(f'🚨 TG推送失败: token失效({r.status_code})')
+                return False
+            else:
+                log(f'TG推送重试{attempt+1}: {r.status_code}')
+                time.sleep(1)
+        except Exception as e:
+            log(f'TG推送异常: {e}')
+            time.sleep(1)
+    return False
+
 # === 安全保卫 ===
 CRASH_COUNT_FILE = "/root/.openclaw/workspace/.crash_count"
 CRASH_WINDOW_SECS = 600      # 10分钟内
