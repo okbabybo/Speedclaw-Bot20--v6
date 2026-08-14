@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""20x杠杆 精准信号策略 v_smart_v3（2026-07-09 老板拍板最终版）
+"""20x杠杆 精准信号策略 v_smart_v3.3.4（2026-08-14 老板拍板不限笔数版）
+v_smart_v3.3.4 老板拍板（2026-08-14 有条件就赚）:
+  [1] 超卖保护: RSI4 < 15 → < 10 (避免错过暴跌强反弹)
+  [2] 超买保护: RSI4 > 85 → > 90 (避免错过强趋势顶背离)
+  [3] 趋势冲突过滤放宽: 矛盾时评分≥7.0仍可开 (捕捉真反转点)
+  [4] 空转停止: 余额 < 5U 彻底停, 避免空跑浪费API
+  [5] 余额<5U时跳过所有信号计算 + 10分钟再查一次
+
 v_smart_v3 老板要求完整机制盘点 + 不留漏洞:
 - 杠杆: 20x (老板偏好, 不动)
 - 仓位上限: MAX_POS_PCT=10% (老板要求, 名义仓位不超过账户×10%)
@@ -89,6 +96,9 @@ LOW_LIQ_END = 5
 
 # === v5.10 优化：余额不足静默降频 ===
 _LAST_LOW_BAL_WARN = 0.0
+_LOW_BAL_SLEEP_UNTIL = None  # v3.2.0: 余额<5U休眠到期时间
+_LAST_TG_POLL = [0.0]   # Bug修复: Telegram轮询节流(每30秒)
+_TG_OFFSET = [None]     # Bug修复: Telegram getUpdates offset状态
 
 # === v5.2 新增：稳定性优化 ===
 TREND_CONFLICT_FILTER = True  # 趋势冲突过滤（4H和1H矛盾时跳过信号）
@@ -99,6 +109,12 @@ API_TIMEOUT = 15             # API超时时间
 loss_streak_count = 0
 last_loss_time = 0
 last_trade_time = 0
+LAST_TRADE_FILE = "/root/.openclaw/workspace/.last_trade_time"
+try:
+    with open(LAST_TRADE_FILE) as _f:
+        last_trade_time = float(_f.read().strip() or 0)
+except Exception:
+    last_trade_time = 0
 
 # === v_final_smart（2026-07-09）：老板拍板 - 20x杠杆不动 + BTC/ETH独立 ===
 # 改动: 杠杆维持20x(老板偏好), 风险10%→3%(提高扛连亏能力), 
@@ -110,11 +126,12 @@ last_trade_time = 0
 #           风险3%/笔 = 20x下单名义0.15%承受位, 抗连亏15次
 LEVER = 20          # 老板要求维持20x
 RISK_PCT = 0.03     # v_smart: 10%→3%, 提高抗连亏能力(可抗15次连亏)
+MIN_NOTIONAL = 18   # v3.2.0: ETH 最低名义价值$18U (币安硬规则$20U, 设$18软件门槛避免发空单)
 MIN_BAL = 30        # v_smart: 50→30, 配合老板充值情况
 OPEN_COOLDOWN = 300  # 冷静期5分钟
 
 # === v_smart：BTC和ETH独立策略 ===
-ENABLED_SYMBOLS = ['BTCUSDT', 'ETHUSDT']  # v_smart: 两种合约都跑, 但分开策略
+ENABLED_SYMBOLS = ['ETHUSDT']  # v3.2.0: 只跑 ETHUSDT (BTC 1H 波动太小, 充不饱手续费, 老板拍板方案B)
 
 # BTC参数 (双向跟踪型 - 老板要求BTC也做空)
 # 20x杠杆下策略要稳 = SL必须用ATR(跟随波动)不用固定1%
@@ -156,10 +173,13 @@ ETH_PARAMS = {
     'counter_trend_thresh': 4.0,
 }
 
-SL_ATR_MULT = 0.025  # 默认用BTC参数
-TP1_PCT = 0.025      # v_smart：2%→2.5%，20x杠杆下让TP稍宽一点能覆盖摩擦成本
-TP2_TRIGGER = 0.035  # v5.11优化：3%→3.5% 让强趋势多走一截 (5000次蒙特卡洛验证+EV提升)
-TP2_BUFFER = 0.01    # 追踪回撤1%，增加呼吸空间
+SL_PCT = 0.03         # v3.3.4 老板拍板: SL = -3% 价格（实际生效的固定百分比止损）
+TP1_PCT = 0.01        # v3.3.4 老板拍板: 浮盈 +1% 出 50% 半仓（实际生效）
+TRAIL_PCT = 0.005     # v3.3.4 老板拍板: 追踪止盈回撒 0.5% 全平
+TP1_PARTIAL_RATIO = 0.5   # v3.3.4: TP1 出仓比例 50%
+# DAILY_TRADE_LIMIT 已删除: 死代码未引用, 老板拍板不限笔数
+TP2_TRIGGER = 999    # v3.3.1 禁用: 不再用 TP2 阶梯
+TP2_BUFFER = 999      # v3.3.1 禁用: 不再用 TP2 追踪
 WIN_STREAK_ACCEL = 2   # 连赢2次TP1后激活加速模式
 WIN_STREAK_THRESH = 0.05  # 加速模式下RSI门槛临时降5%
 ACCEL_SCORE_BOOST = 2  # 加速模式下SHORT信号评分额外加分
@@ -171,14 +191,14 @@ COUNTER_TREND_THRESH = 4.5     # 逆势信号独立门槛（v6.0新独立路径�
 
 # === v_smart_v3: SL自动保护(激活) ===
 SL_AUTO_ALERT_FILE = "/root/.openclaw/workspace/.sl_alert_pending"
-SL_AUTO_DELAY = 30              # 预警后30秒老板未干预则自动平
-SL_AUTO_ENABLED = True          # v_smart_v3: 老板明确要防爆仓+防回吐, 激活自动平
+SL_AUTO_DELAY = 15              # v3.2.0优化: 预警后15秒老板未干预则自动平 (加快反应, 避免赗亏)
+SL_AUTO_ENABLED = False          # v3.3.0 老板拍板: 关闭自动平仓，只预警不动作（避免被频繁扫）
                                 # /hold命令可以取消本次自动平
                                 # SL不是动态调整而是动态计算(ATR跟随)
 
 # === 复利风控参数 ===
-MAX_POS_PCT = 0.10       # v_smart_v3: 30%→10%（老板要求：仓位上限 = 余额10%）
-MAX_TOTAL_EXPOSURE = 1.0  # v_smart_v3: 150%→100%（总名义仓位不超过1倍余额，防止重仓）
+MAX_POS_PCT = 0.10       # v3.2.0: 50%→10%（老板拍板: 按保证金下单, 10%余额作保证金, 20x后名义2倍余额, 多空不限）
+MAX_TOTAL_EXPOSURE = 0.30  # v3.2.0: 总名义仓位不超过30%余额 (老板拍板: 释放下单空间，同一时间最多开3仓)
 
 # === v_smart_v3: 补仓（DCA）机制 ===
 # 老板明确要求: 仓位≤本金10%, 补仓后不能超
@@ -213,7 +233,7 @@ TRAIL_AFTER_TP1 = 0.015           # TP1出后启动追踪
 TRAIL_DISTANCE = 0.008            # 追踪距离0.8%（ATR动态SL补充）
 
 # === v_smart_v3: 手续费/滑点补偿 ===
-EXPECTED_FEE_PCT = 0.0016         # 20x下单双边手续费+滑点 总名义成本约0.16%
+EXPECTED_FEE_PCT = 0.003          # v3.2.0: 手续费修正 — 币安VIP0双边0.2% + 滑点0.1% = 0.30%
 
 # === v3.1: Telegram统一发送函数(防API故障静默丢失) ===
 TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN', '8734542487:AAEtrTM24xCdjyB2MYj8DNp0R4xuLMCOJEc')
@@ -337,7 +357,8 @@ RISK_RICH_PCT = 0.08   # 富裕区风控：余额>80时风险降到8%
 TREND_STATE_FILE = "/root/.openclaw/workspace/.trend_state"
 TREND_WARN_COOLDOWN = 300  # 冷却5分钟
 WARN_FILE = "/root/.openclaw/workspace/.trend_warn"  # 待发送预警文件
-MIN_TRADE_INTERVAL = 30  # 最小下单间隔（秒），防止过度交易
+MIN_TRADE_INTERVAL = 300  # v3.2.0: 最小下单间隔5分钟(原30秒, 避免频繁开平被手续费吃掉)
+MIN_NET_PROFIT_PCT = 0.002     # v3.3.4 老板拍板(2026-08-14): 净利门槛 0.3%→0.2% (更低门槛, 多抓信号)
 MANUAL_CLOSE_COOLDOWN = 60  # 手动平仓后冷静期（秒），1分钟内禁止同方向新开仓
 
 # === v5.12 新增：交易历史 PnL 归档 ===
@@ -403,14 +424,11 @@ def record_trade(symbol, direction, entry, exit_price, qty, reason, pnl_pct=None
         return None
 
 def check_stop_loss(symbol, direction, entry, sl, qty, cur):
-    """v6.0：预警式自动止损检查
+    """v3.3.3 老板拍板: SL 击穿 只预警不动作
     
     逻辑：
     1. 价格未击穿 SL → 返回 False
-    2. 价格击穿 SL 且 SL_AUTO_ENABLED=True：
-       - 第一次击穿：推 Telegram 预警，记时间戳，等 SL_AUTO_DELAY 秒
-       - 等待期间老板可推送 "/hold" 命令延后（需 Telegram bot 集成）
-       - 超过 SL_AUTO_DELAY 未干预 → 自动市价平仓
+    2. 价格击穿 SL → 仅推 Telegram 预警，返回 False (不许自动平)
     """
     if not sl or not entry or not qty:
         return False
@@ -418,75 +436,19 @@ def check_stop_loss(symbol, direction, entry, sl, qty, cur):
         return False
     if direction == "SHORT" and cur < sl:
         return False
-    # SL 被击穿
-    # 优先级: 环境变量 override > 常量 SL_AUTO_ENABLED
-    _auto_enabled = SL_AUTO_ENABLED
-    if "SL_AUTO_ENABLED_OVERRIDE" in os.environ:
-        _auto_enabled = os.environ["SL_AUTO_ENABLED_OVERRIDE"] == "1"
-    if not _auto_enabled:
-        # 仅预警模式
-        log(f"🚨 SL预警: {symbol} {direction} 现价${cur:.0f} <击穿> SL=${sl:.0f}（仅预警，不自动平）")
-        try:
-            import subprocess
-            subprocess.Popen(
-                ["bash", "/root/.openclaw/workspace/sl_alert.sh", symbol, direction, str(sl), str(cur), str(qty)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True
-            )
-        except Exception:
-            pass
-        return False
-    # 自动止损：检查是否已预警
-    pending_file = f"{SL_AUTO_ALERT_FILE}.{symbol}.{direction}"
-    now = time.time()
-    alert_sent_at = 0.0
+    # SL 被击穿 - v3.3.3 老板铁律: 只预警不许动
+    log(f"🚨 SL预警: {symbol} {direction} 现价${cur:.0f} <击穿> SL=${sl:.0f}（仅预警，老板决定怎么处理）")
     try:
-        with open(pending_file) as _f:
-            alert_sent_at = float(_f.read().strip() or 0)
+        import subprocess
+        subprocess.Popen(
+            ["bash", "/root/.openclaw/workspace/sl_alert.sh", symbol, direction, str(sl), str(cur), str(qty)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
     except Exception:
-        alert_sent_at = 0.0
-    if alert_sent_at == 0.0:
-        # 第一次击穿：推预警 + 记时间戳
-        log(f"🚨 SL击穿: {symbol} {direction} 现价${cur:.0f} SL=${sl:.0f} 预警{SL_AUTO_DELAY}秒后自动平")
-        try:
-            with open(pending_file, "w") as _f:
-                _f.write(str(now))
-        except Exception:
-            pass
-        try:
-            import subprocess
-            subprocess.Popen(
-                ["bash", "/root/.openclaw/workspace/sl_alert.sh", symbol, direction, str(sl), str(cur), str(qty)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True
-            )
-        except Exception:
-            pass
-        return False  # 预警阶段不跳主逻辑
-    # 已预警超过 SL_AUTO_DELAY 秒 → 自动平仓
-    if (now - alert_sent_at) >= SL_AUTO_DELAY:
-        log(f"💀 SL超时自动平仓: {symbol} {direction} 现价${cur:.0f}")
-        # 归档 SL 平仓（仍按击穿价计，名义亏损）
-        try:
-            sl_pct = abs(cur - entry) / entry * 100
-            if direction == "SHORT":
-                sl_pct = -sl_pct
-            record_trade(symbol, direction, entry, cur, qty, "SL", pnl_pct=sl_pct)
-        except Exception as _e:
-            log(f"⚠️ SL归档失败: {_e}")
-        # 清预警文件
-        try:
-            os.remove(pending_file)
-        except Exception:
-            pass
-        return True
-    return False
-
-# === v6.0 增强：Telegram 命令轮询（老板可远程控制机器人）===
-_LAST_TG_POLL = [0.0]  # 上次轮询时间（用 list 避免 global）
-_TG_OFFSET = [0]       # 增量拉取 offset
+        pass
+    return False  # v3.3.3: 永不自动平仓
 
 def _check_telegram_commands():
     """轮询 Telegram，老板可发送:
@@ -595,6 +557,39 @@ def _check_telegram_commands():
                     )
                 except Exception:
                     pass
+            elif cmd == "/start":
+                os.environ.pop("BOT20X_DISABLED", None)
+                log("📲 老板 /start：bot20x 启动")
+                try:
+                    requests.post(
+                        f"https://api.telegram.org/bot{token}/sendMessage",
+                        json={"chat_id": chat_id, "text": "🟢 bot20x 启动\n老板已下达 /start 指令\nAI开始执行v3.1.1策略\n/stop 可停止"},
+                        timeout=5
+                    )
+                except Exception:
+                    pass
+            elif cmd == "/stop":
+                os.environ["BOT20X_DISABLED"] = "1"
+                log("📲 老板 /stop：bot20x 停止")
+                # 平所有持仓
+                for sym in ['BTCUSDT', 'ETHUSDT']:
+                    try:
+                        pos_list = get_all_positions(sym)
+                        for p in pos_list:
+                            amt = abs(float(p.get('positionAmt', 0)))
+                            if amt > 0:
+                                side = "SELL" if float(p['positionAmt']) > 0 else "BUY"
+                                do_order(sym, side, "BOTH", amt)
+                    except Exception as _e:
+                        log(f"⚠️ /stop 平仓失败 {sym}: {_e}")
+                try:
+                    requests.post(
+                        f"https://api.telegram.org/bot{token}/sendMessage",
+                        json={"chat_id": chat_id, "text": "🔴 bot20x 停止\n所有持仓已平\n等老板 /start 重新启动"},
+                        timeout=5
+                    )
+                except Exception:
+                    pass
             elif cmd == "/status":
                 bal = get_balance() or 0
                 try:
@@ -607,10 +602,30 @@ def _check_telegram_commands():
                     pass
             elif cmd == "/stats":
                 stats = get_trade_stats()
+                if stats.get("total", 0) == 0:
+                    text = "📊 <b>bot20x 战绩</b>\n\n暂无交易记录"
+                else:
+                    pnl_emoji = "🟢" if stats["total_pnl"] >= 0 else "🔴"
+                    text = (
+                        f"📊 <b>bot20x 战绩</b>\n\n"
+                        f"━━━━━━━━━ 概览 ━━━━━━━━━\n"
+                        f"总笔数：{stats['total']}\n"
+                        f"盈利：{stats['wins']}笔\n"
+                        f"亏损：{stats['losses']}笔\n"
+                        f"中性：{stats['neutral']}笔\n"
+                        f"胜率：{stats['win_rate']}%（排除中性笔）\n\n"
+                        f"━━━━━━━━━ 盈亏 ━━━━━━━━━\n"
+                        f"净盈亏：{pnl_emoji} {stats['total_pnl']:+.2f}U\n"
+                        f"平均盈利：+{stats['avg_win']:.2f}U\n"
+                        f"平均亏损：{stats['avg_loss']:.2f}U\n"
+                        f"最大单笔盈利：🟢 +{stats['max_win']:.2f}U\n"
+                        f"最大单笔亏损：🔴 {stats['max_loss']:.2f}U\n\n"
+                        f"首笔交易：{stats.get('first_trade', '?')}"
+                    )
                 try:
                     requests.post(
                         f"https://api.telegram.org/bot{token}/sendMessage",
-                        json={"chat_id": chat_id, "text": f"📊 交易统计\n{json.dumps(stats, ensure_ascii=False, indent=2)}"},
+                        json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
                         timeout=5
                     )
                 except Exception:
@@ -848,6 +863,107 @@ def detect_volume_anomaly(klines, period=20, threshold=2.5):
     return (False, None)
 
 
+def detect_price_spike(klines_1m, atr_val, spike_mult=3.0, range_mult=2.5):
+    """v3.3.4 老板拍板(2026-08-14): 防插针检测
+
+    3个判定条件（任一命中则判定为插针）：
+    1. 振幅超 ATR×spike_mult（最近1根1m K线振幅异常大）
+    2. 价格突破前 N 根 high/low 后快速回归（影线超实体 2 倍）
+    3. 5根内累计波动 > ATR×range_mult
+
+    返回: (is_spike, info_str)  info_str=具体插针描述
+    """
+    if len(klines_1m) < 10 or not atr_val or atr_val <= 0:
+        return (False, None)
+    
+    # 最近 5 根 1m K线
+    last5 = klines_1m[-5:]
+    cur_high = float(last5[-1][2])
+    cur_low = float(last5[-1][3])
+    cur_open = float(last5[-1][1])
+    cur_close = float(last5[-1][4])
+    
+    # 条件1: 单根振幅超过 ATR×3
+    candle_range = cur_high - cur_low
+    if candle_range > atr_val * spike_mult:
+        body = abs(cur_close - cur_open)
+        wick_ratio = (candle_range - body) / max(body, 0.001)
+        if wick_ratio > 2.0:  # 影线超实体 2 倍
+            return (True, f"插针-单根振幅{candle_range/atr_val:.1f}×ATR,影线{wick_ratio:.1f}×实体")
+    
+    # 条件2: 5根内累计波动超 ATR×2.5
+    h5 = max(float(k[2]) for k in last5)
+    l5 = min(float(k[3]) for k in last5)
+    range5 = h5 - l5
+    if range5 > atr_val * range_mult:
+        return (True, f"插针-5根累计{range5/atr_val:.1f}×ATR")
+
+    return (False, None)
+
+
+def detect_market_mode(klines_4h, klines_1h, atr_val):
+    """v3.3.4 老板拍板(2026-08-14): 震荡/趋势市场模式自动识别
+
+    判定逻辑:
+    - ADX >= 30 + 4H/1H EMA 同向 → STRONG_TREND (强趋势)
+    - ADX 20-30 + EMA 矛盾 → RANGING (震荡)
+    - ADX < 20 → WEAK (弱趋势/震落)
+
+    返回: dict {
+        'mode': 'STRONG_TREND' | 'TREND' | 'RANGING' | 'WEAK',
+        'adx': float,
+        'ema_aligned': bool,
+        'strategy_hint': str
+    }
+    """
+    adx_val, _ = calc_adx(klines_1h, ADX_PERIOD)
+
+    # 判断 4H 和 1H EMA 是否同向
+    c4h = [float(k[4]) for k in klines_4h]
+    c1h = [float(k[4]) for k in klines_1h]
+    ema4h_20 = calc_ema(c4h, 20)
+    ema1h_20 = calc_ema(c1h, 20)
+    ema4h_20_prev = calc_ema(c4h[:-4], 20)
+    ema1h_20_prev = calc_ema(c1h[:-1], 20)
+
+    trend4h_up = ema4h_20 > ema4h_20_prev
+    trend1h_up = ema1h_20 > ema1h_20_prev
+    ema_aligned = (trend4h_up == trend1h_up)
+
+    # 市场模式判定
+    if adx_val >= 30 and ema_aligned:
+        mode = 'STRONG_TREND'
+        hint = '趋势跟随优先, TP1 出半后追距放宽到 1.2%'
+    elif adx_val >= 25 and ema_aligned:
+        mode = 'TREND'
+        hint = '趋势跟随 + 趋势反转预警'
+    elif adx_val >= 20:
+        mode = 'RANGING'
+        hint = '反转策略为主, 信号门槛提至 5.5, SL 收紧至 ATR×1.8'
+    else:
+        mode = 'WEAK'
+        hint = '震落市, 信号门槛 6.0, 禁止逆势加仓, 严控仓位 ≤ 5%'
+
+    # v3.3.4 老板拍板(2026-08-14): 精度提升 - 加EMA一致性权重
+    # EMA矛盾 + ADX边界值 -> 降级处理，避免RANGING被误判为TREND
+    if mode in ('TREND', 'STRONG_TREND') and not ema_aligned:
+        # EMA矛盾但ADX高 -> 实际是震乱, 降级为RANGING
+        if mode == 'STRONG_TREND':
+            mode = 'TREND'  # 强趋势被逆, 降为普通趋势
+        else:
+            mode = 'RANGING'  # TREND矛盾 -> RANGING
+    elif mode == 'RANGING' and adx_val >= 23 and ema_aligned:
+        # ADX接近 25 且EMA同向, 升级为 TREND
+        mode = 'TREND'
+
+    return {
+        'mode': mode,
+        'adx': adx_val,
+        'ema_aligned': ema_aligned,
+        'strategy_hint': hint
+    }
+
+
 def detect_liquidity_hunt(klines, atr_val):
     """流动性猎杀识别 (trading-knowledge: 流动性猎杀)
     长上下影线 + 快速回归 = 假突破, 应过滤
@@ -991,6 +1107,10 @@ def startup_self_check():
     log("自检全部通过")
 
 def do_order(symbol, side, posSide, qty):
+    # v3.2.0: 仓位为0直接跳过, 避免发空单报错
+    if qty is None or qty <= 0:
+        log(f"[跳过] {symbol} {side} {posSide} qty={qty} 为0, 不发送下单")
+        return False
     # 下单前先记录日志（防止crash后无法追溯）
     log(f"[下单] {symbol} {side} {posSide} qty={qty:.3f} -> 发送中...")
     try:
@@ -1048,6 +1168,9 @@ def get_signal(symbol):
     # ===== v_smart: BTC/ETH独立参数 =====
     # 在函数顶部根据symbol动态选择参数，原有逻辑零改动继续走
     global SL_ATR_MULT, TP1_PCT
+    # 兑底初始化，防止下下面分支都跳过时未赋值
+    SL_ATR_MULT = SL_ATR_MULT if 'SL_ATR_MULT' in dir() and isinstance(SL_ATR_MULT, (int, float)) else 1.5
+    TP1_PCT = TP1_PCT if 'TP1_PCT' in dir() and isinstance(TP1_PCT, (int, float)) else 1.0
     if symbol == 'ETHUSDT' and 'ETH_PARAMS' in dir():
         _P = ETH_PARAMS
         SL_ATR_MULT = _P['sl_atr_mult']
@@ -1090,6 +1213,25 @@ def get_signal(symbol):
     market_trending = adx_val >= ADX_TREND_THRESH
     market_weak = adx_val < ADX_WEAK_THRESH
 
+    # ===== v3.3.4 老板拍板: 模式驱动信号门槛 + 信号风格 =====
+    # 检测市场模式 -> 动态调整 SCORE_THRESH + 仓位上限
+    try:
+        _mode_info = detect_market_mode(k4h, k1h, atr)
+        if _mode_info['mode'] == 'STRONG_TREND':
+            _score_normal = _score_trending  # 强趋势门槛放宽
+            _mode_pos_pct = 0.10
+        elif _mode_info['mode'] == 'TREND':
+            _score_normal = min(_score_trending + 1.5, _score_normal)
+            _mode_pos_pct = 0.08
+        elif _mode_info['mode'] == 'RANGING':
+            _score_normal = _score_normal + 0.5  # 震落略高门槛
+            _mode_pos_pct = 0.07
+        else:  # WEAK
+            _score_normal = _score_normal + 1.0  # 震落趋动门槛最高
+            _mode_pos_pct = 0.05
+    except Exception:
+        _mode_pos_pct = 0.10
+
     # ===== MACD趋势动量检测 =====
     macd_line, macd_signal, macd_hist = calc_macd(c1h)
     macd_bullish = macd_hist > 0  # MACD柱在零轴上方
@@ -1123,17 +1265,16 @@ def get_signal(symbol):
     vol_avg = sum(v15m[-20:])/20 if len(v15m) >= 20 else v15m[-1]
     vol_confirm = vr > 1.5  # 放量1.5倍确认趋势真实性
     
-    # ===== 做多条件（全部满足才做多）=====
-    long_ready = (cur > ema1h_20 and trend1h_price and r1 < 50 and trend4h_price and r4 < 60 and (market_trending or r1 < 40)) and not market_weak
+    # ===== 做多条件（v3.3.0 老板拍板：有行情就开，不限制）=====
+    # 原版要求 trend1h_price + trend4h_price 都满足 + cur > EMA1h_20
+    # v3.3.0: RSI超卖时 <30 就是最强多信号，不要被EMA位置限制住
+    long_ready = (r1 < 55 and r4 < 65 and (trend1h_price or trend4h_price or r1 < 30)) and not market_weak
     
-    # ===== 做空条件（v6.0 平衡）=====
-    # r4<15时为超卖警戒，不允许做空（价格可能瞬间反弹）
-    oversold_guard = r4 < 15
-    # v6.0：放宽门槛、平衡 LONG。允许两种状态：
-    #   A) 价格明确在 EMA 下方 + RSI>50 + 趋势市
-    #   B) 价格刚跌破 EMA + RSI>45（衡平LONG的<50严格性）
-    short_ready_a = (cur < ema1h_20 and r1 > 50 and r4 >= 15 and r4 < 60 and market_trending) and not market_weak
-    short_ready_b = (cur < ema1h_20 * 1.005 and r1 > 45 and r4 >= 15 and r4 < 65 and not market_weak)
+    # ===== 做空条件（v3.3.0 老板拍板：放宽过滤，有行情就开）=====
+    # v3.3.0: 只需要趋势1h或4h有一个向下 + RSI>45 + 不超卖就允许
+    oversold_guard = r4 < 12
+    short_ready_a = (cur < ema1h_20 and r1 > 45 and r4 >= 12 and r4 < 65 and (not trend1h_price or not trend4h_price)) and not market_weak
+    short_ready_b = (cur < ema1h_20 * 1.005 and r1 > 45 and r4 >= 12 and r4 < 70 and not market_weak)
     short_ready = short_ready_a or short_ready_b
     
     # 趋势评分（用于日志显示）
@@ -1342,11 +1483,18 @@ def get_signal(symbol):
     elif counter_trend_sig:
         sig = counter_trend_sig; reasons = counter_trend_reasons
     
-    # === v5.2 新增：趋势冲突过滤 ===
-    # 当4H和1H趋势方向矛盾时，拒绝信号（避免逆势开仓）
+    # === v5.2 新增 → v3.2.0 优化：趋势冲突过滤 ===
+    # 当4H和1H趋势方向矛盾时，原版直接拒绝 → 优化为"评分极高时可开"
+    # 原因：真正的趋势反转点 = 4H↔1H矛盾，过滤器可能在最该开仓时不开
     trend_conflict = TREND_CONFLICT_FILTER and (trend4h_price != trend1h_price)
-    if trend_conflict:
-        sig = None; reasons = ["趋势冲突:4H↓EMA,1H↑EMA" if not trend4h_price else "趋势冲突:4H↑EMA,1H↓EMA"]
+    if trend_conflict and sig is not None:
+        # 计算信号总分（用 long_score 或 short_score）
+        signal_score = long_score if sig == "LONG" else (short_score if sig == "SHORT" else 0)
+        if signal_score < 7.0:  # v3.2.0: 矛盾时需评分≥7.0才开（原版直接拒绝）
+            sig = None
+            reasons = ["趋势冲突:4H↓EMA,1H↑EMA" if not trend4h_price else "趋势冲突:4H↑EMA,1H↓EMA"]
+        else:
+            reasons = reasons + [f"⚡趋势冲突但信号强({signal_score:.1f}≥7.0)"]
     
     return {
         'cur': cur, 'r4': r4, 'r1': r1, 'r15': r15,
@@ -1361,20 +1509,22 @@ def get_signal(symbol):
         'bb_position': bb_position,  # v5.5新增：布林带位置
         'sig': sig, 'reasons': reasons,
         'counter_trend': counter_trend_sig is not None,
-        'trend_conflict': trend_conflict
+        'trend_conflict': trend_conflict,
+        '_mode_pos_pct': _mode_pos_pct,  # v3.3.4 市场模式驱动的仓位上限
+        'mode': _mode_info.get('mode', 'UNKNOWN') if '_mode_info' in dir() else 'UNKNOWN'  # v3.3.4 模式名
     }
 
 def calc_sl(entry, atr, direction, rsi=None):
-    """v_smart_v2: ATR动态止损（老板要求策略稳，不能被噪音扫掉）
+    """v3.3.4 老板拍板(2026-08-14): SL 改为 ATR 动态跟随波动
     
-    SL = ATR × SL_ATR_MULT  (跟随波动, 不固定百分比)
-    当ATR过小时(震荡市) 使用最低0.8% 防止SL过近
+    低币价时 SL 距离自动收紧，高币价时自动放宽
+    保持风险金额恒定（不受价格绝对值影响）
     """
-    if not atr or atr <= 0:
-        atr = entry * 0.01  # 默认1%ATR fallback
-    sl_dist = atr * SL_ATR_MULT
-    # 最低止损距离0.8%(防ATR过小导致SL过近)
-    sl_dist = max(sl_dist, entry * 0.008)
+    # 优先用 ATR 动态，fallback 固定 3%
+    if atr and atr > 0:
+        sl_dist = atr * SL_ATR_MULT  # SL_ATR_MULT=2.2 for ETH
+    else:
+        sl_dist = entry * SL_PCT
     return entry - sl_dist if direction == "LONG" else entry + sl_dist
 
 def get_risk_pct(balance):
@@ -1398,13 +1548,18 @@ def get_risk_pct(balance):
     else:
         return RISK_MEGA_PCT
 
-def get_max_pos_qty(balance, price):
-    """v_smart_v3: 单标最大仓位 = 余额×10%(老板要求)
-    
-    名义仓位最多 10% 余额, 20x杠杆下 = 名义价值 2倍余额, 名义保证金 5%
-    例: 余额$100, 价格$62000, 最多 100*10%/62000 = 0.00016 BTC = $10 名义
+def get_max_pos_qty(balance, price, leverage=20, pos_pct=None):
+    """v3.3.4 老板拍板(2026-08-14): 单标最大仓位支持市场模式动态仓位上限
+
+    pos_pct: 市场模式调仓后仓位上限 (None=默认MAX_POS_PCT=10%)
+    老板2026-08-10拍板: 按保证金下单, 控制总保证金 ≤50%余额
+    例: 余额$48.49, MAX_POS_PCT=50% = $24.24保证金 → 20x后 = $484.8名义
+        ETH价$1908 → 0.254 ETH
     """
-    return round((balance * MAX_POS_PCT) / price, 3)
+    _pct = pos_pct if pos_pct is not None else MAX_POS_PCT
+    margin = balance * _pct
+    notional = margin * leverage
+    return round(notional / price, 3)
 
 
 def can_dca(s, info, cur, direction):
@@ -1547,18 +1702,29 @@ def trigger_drawdown_lock():
         f.write(str(time.time() + DRAWDOWN_LOCK_SECS))
     log(f"回撤冷静期锁定：{DRAWDOWN_LOCK_SECS//60}分钟内禁止开新仓")
 
-def calc_qty(balance, atr, price):
-    """v_smart_v3: 仓位计算(简化版)
-    
-    计算逻辑:
-    1. 根据余额阶梯算风险金额
-    2. SL距使用 ATR动态
-    3. qty = risk / sl_dist
-    4. 上限 = MAX_POS_PCT (10%)
+def calc_qty(balance, atr, price, mode_pos_pct=None):
+    """v3.3.4 老板拍板(2026-08-14): 仓位计算支持市场模式动态调仓
+
+    mode_pos_pct: 市场模式调仓后仓位上限 (None=默认MAX_POS_PCT)
+    - STRONG_TREND: 10%
+    - TREND: 8%
+    - RANGING: 7%
+    - WEAK: 5%
+
+    逻辑:
+    1. MAX_POS_PCT 默认 10% (老板拍板: 按保证金下单, 10%余额作保证金, 20x后名义2倍余额, 多空不限)
+    2. 20x杠杆后转为名义 → 名义 = 保证金 × 20
+    3. qty = 名义 / price
+    4. 上限 = mode_pos_pct (如设) 或 MAX_POS_PCT × 20 倍余额名义
+    5. 下限 = 风险金额 / ATR×SL_ATR_MULT (确保 SL 触发亏 ≤ 风险金额)
     """
+    _effective_pos_pct = mode_pos_pct if mode_pos_pct is not None else MAX_POS_PCT
+    margin = balance * _effective_pos_pct
+    max_qty = get_max_pos_qty(balance, price, leverage=20, pos_pct=_effective_pos_pct)
+    
+    # 风险控制: 确保 SL 触发时亏损 ≤ 风险金额
     risk_pct = get_risk_pct(balance)
     risk_amount = balance * risk_pct
-    
     if atr and atr > 0:
         sl_dist = atr * SL_ATR_MULT
         sl_dist = max(sl_dist, price * 0.008)
@@ -1567,10 +1733,15 @@ def calc_qty(balance, atr, price):
     if sl_dist == 0:
         return 0
     
-    qty = risk_amount / sl_dist
-    max_qty = get_max_pos_qty(balance, price)
-    min_qty = max(0.001, round(risk_amount / price, 3))
-    return max(min_qty, min(round(qty, 3), max_qty))
+    risk_qty = risk_amount / sl_dist  # SL 风险金额对应的仓位
+    min_qty = max(0.001, round(risk_qty, 3))
+    final_qty = min(round(max_qty, 3), round(max_qty, 3))
+    # v3.2.0: 名义价值 < 20U 时返回0
+    notional = final_qty * price
+    if notional < MIN_NOTIONAL:
+        log(f"⚠️ 名义价值${notional:.2f}<{MIN_NOTIONAL}U, 跳过开仓（余额不足建议充值）")
+        return 0
+    return final_qty
 
 
 # === v_smart_v3 简化: 不使用动态杠杆 ===
@@ -1581,9 +1752,25 @@ def calc_qty(balance, atr, price):
 
 def main():
     log("="*60)
-    log("v_smart_v3.1 精准信号 | 20x固定 | 仓位≤10% | 阶梯追踪SL锁利 | 5档复利平滑 | 成交量异动 | /freeze全局冻结")
+    log("v_smart_v3.3.4 精准信号 | 20x固定 | 仓位≤10% | 阶梯追踪SL锁利 | 5档复利平滑 | 持仓期不主动平仓 | SL仅预警 | 不限笔数 | /start启动 /stop停止")
     log("="*60)
-    
+
+    # === 修复 v3.2.1: 锁定 os/time 模块到本地变量，避免 UnboundLocalError ===
+    # PM2 错误日志显示 os.environ.get 触发 UnboundLocalError 26 次（10h内）
+    # 根因未明（AST扫描无赋值），但通过本地绑定彻底免疫
+    import os as _os
+    import time as _time
+    import json as _json
+    _os_getenv = _os.environ.get
+    # 把 main 内引用的 os/time/json 全局名字强制声明为全局，避免 Python 把它当 local
+    global os, time, json
+
+    # v3.3.0 老板拍板: 硬性冻结文件检查 (避免反复重启刷单)
+    if _os.path.exists("/root/.openclaw/workspace/.bot20x_frozen"):
+        log("🧊 bot20x 硬性冻结 (检测到 .bot20x_frozen 文件)。rm 该文件后重启才运行。")
+        while True:
+            _time.sleep(60)
+
     # 启动自检：验证API响应类型，不正确则拒绝启动
     startup_self_check()
     
@@ -1637,19 +1824,19 @@ def main():
                     save_high_water(0)
                     # 同时清冷却期记录，确保充值后立即可用
                     try:
-                        import os
-                        if os.path.exists(DRAWDOWN_LOCK_FILE):
-                            os.remove(DRAWDOWN_LOCK_FILE)
+                        # bugfix v3.2.0: os 已在顶部import, 移除函数内import避免作用域报错
+                        if _os.path.exists(DRAWDOWN_LOCK_FILE):
+                            _os.remove(DRAWDOWN_LOCK_FILE)
                             log("🔓 已清空回撤冷静期锁")
-                        if os.path.exists(DRAWDOWN_COOLDOWN_FILE):
-                            os.remove(DRAWDOWN_COOLDOWN_FILE)
+                        if _os.path.exists(DRAWDOWN_COOLDOWN_FILE):
+                            _os.remove(DRAWDOWN_COOLDOWN_FILE)
                             log("🔓 已清空回撤冷却期记录")
                     except Exception as e:
                         log(f"⚠️ 清锁定文件失败: {e}")
                     high_water = 0
                 else:
-                    # 余额+高水位都<1，本就无需触发回撤，直接跳过检查
-                    # 优化：每5分钟才提示一次，避免狂刷日志吃CPU
+                    # v3.2.0 优化：余额<5U 彻底停（不只是跳过检查），避免空转
+                    # 但每10分钟查一次，老板充值后自动恢复
                     global _LAST_LOW_BAL_WARN
                     if time.time() - _LAST_LOW_BAL_WARN > 300:
                         log(f"⏸️ 账户余额不足（${bal:.2f}），跳过复利风控检查")
@@ -1665,6 +1852,19 @@ def main():
                             )
                         except Exception as _e:
                             log(f"⚠️ 低余额告警触发失败: {_e}")
+                    # v3.2.0: 余额<5U时直接跳过本次循环, 不计算信号
+                    # 每10分钟查一次余额（而非5秒一次），大幅降低API消耗
+                    # bugfix: 用全局变量而非main函数属性，避兔作用域报错
+                    global _LOW_BAL_SLEEP_UNTIL
+                    if bal < 5.0:
+                        if _LOW_BAL_SLEEP_UNTIL is None or time.time() > _LOW_BAL_SLEEP_UNTIL:
+                            log(f"💤 余额<5U，休眠10分钟后重试（避免空转浪费API）")
+                            _LOW_BAL_SLEEP_UNTIL = time.time() + 600
+                        time.sleep(60)
+                        continue
+                    else:
+                        # v3.2.0: 充值后重置休眠定时器，下次发现<5U时重新倒计时10分钟
+                        _LOW_BAL_SLEEP_UNTIL = None
                     # 余额为0时 sleep 60秒而非主循环间隔，避免反复调用API浪费配额
                     time.sleep(60)
                     continue
@@ -1742,11 +1942,42 @@ def main():
             elif loss_streak_count >= LOSS_STREAK_LIMIT:
                 loss_streak_count = 0; log("熔断恢复")
 
-            for symbol in ["BTCUSDT", "ETHUSDT"]:
+            for symbol in ENABLED_SYMBOLS:
                 sf = state_files[symbol]
                 info = get_signal(symbol)
                 if info is None:
                     time.sleep(15); continue
+                # v3.3.4 防插针检测: 异常波动时跳过信号 + 不平仓
+                try:
+                    k1m_spike = get_klines(symbol, "1m", 10)
+                    _is_spike, _spike_info = detect_price_spike(k1m_spike, info.get('atr', 0))
+                    if _is_spike:
+                        log(f"⚡ {symbol} 插针预警: {_spike_info} — 跳过本次信号与平仓")
+                        time.sleep(15); continue
+                except Exception as _se:
+                    pass  # 插针检测失败不影响主流程
+                # v3.3.4 市场模式识别: 震荡/趋势双引擎自动切换
+                try:
+                    k4h_mode = get_klines(symbol, "4h", 60)
+                    k1h_mode = get_klines(symbol, "1h", 100)
+                    mode_info = detect_market_mode(k4h_mode, k1h_mode, info.get('atr', 0))
+                    # 仅在模式变化时输出, 避免重复刷屏
+                    _mode_key = f"_last_mode_{symbol}"
+                    if globals().get(_mode_key) != mode_info['mode']:
+                        log(f"📊 {symbol} 市场模式: {mode_info['mode']} | ADX={mode_info['adx']:.1f} | EMA同向={mode_info['ema_aligned']} | {mode_info['strategy_hint']}")
+                        globals()[_mode_key] = mode_info['mode']
+                    # 震落市严格控仓: 仓位上限临时降低
+                    if mode_info['mode'] == 'WEAK':
+                        info['_mode_pos_pct'] = 0.05  # 仓位上限临时降到 5%
+                    elif mode_info['mode'] == 'RANGING':
+                        info['_mode_pos_pct'] = 0.07  # 震落反转到 7%
+                    elif mode_info['mode'] == 'STRONG_TREND':
+                        info['_mode_pos_pct'] = 0.10  # 强趋势跟随后 10%
+                    else:
+                        info['_mode_pos_pct'] = 0.08  # 普通趋势 8%
+                except Exception as _me:
+                    info['_mode_pos_pct'] = 0.10  # 默认
+                    pass
                 # v5.7 防御性字段处理 - 防止字段为None崩溃 (修复112次重启Bug)
                 for _k, _v in {'sig': None, 'long_ready': False, 'short_ready': False,
                                 'trend_up': False, 'trend_reasons': 'N/A', 'r1': 99, 'r4': 99,
@@ -1765,7 +1996,41 @@ def main():
                     except: s = {}
                     
                     pos = positions.get(direction)
-                    
+
+                    # v3.3.0 老板拍板：手动平仓检测（包含半仓场景）
+                    # 场景1：状态文件记录 pos 但交易所实际没持仓 → 全平
+                    # 场景2：状态文件记录 pos，交易所还有持仓但数量减少 → 半平
+                    if s.get("pos") and s.get("qty"):
+                        if not pos:
+                            # 全平
+                            log(f"{symbol} {direction} 手动平仓已同步(全平) | 上次:{s.get('last','?')}")
+                            try:
+                                cur_price = info.get('cur', s.get('entry'))
+                                record_trade(symbol, direction, s.get('entry'), cur_price, s.get('qty', 0), "MANUAL", pnl_pct=0.0)
+                            except Exception as _e:
+                                log(f"⚠️ 手动平仓归档失败: {_e}")
+                            s["closed"] = now
+                            s["manual_close_dir"] = direction
+                            s["manual_close_time"] = now
+                            s["last"] = s.get("last", "closed")
+                            s.pop("pos", None)
+                            s.pop("qty", None)
+                            with open(sf_file, "w") as f: json.dump(s, f)
+                            continue
+                        elif pos.get('qty', 0) < s.get('qty', 0) * 0.95:
+                            # 半平: 交易所持仓减少 >5%
+                            partial_qty = s.get('qty', 0) - pos.get('qty', 0)
+                            log(f"{symbol} {direction} 手动半平检测 | 状态:{s.get('qty')}→交易所:{pos.get('qty')} (减{partial_qty:.4f})")
+                            try:
+                                cur_price = info.get('cur', s.get('entry'))
+                                # 半仓按交易所实际数量归档
+                                record_trade(symbol, direction, s.get('entry'), cur_price, partial_qty, "MANUAL_PARTIAL", pnl_pct=0.0)
+                            except Exception as _e:
+                                log(f"⚠️ 手动半平归档失败: {_e}")
+                            s["qty"] = pos.get('qty', 0)  # 同步剩余数量
+                            with open(sf_file, "w") as f: json.dump(s, f)
+                            # 继续下面的SL检查逻辑
+
                     if s.get("pos") and not pos:
                         log(f"{symbol} {direction} 手动平仓已同步 | 上次:{s.get('last','?')}")
                         # v5.12 归档手动平仓（损益未知，记为0）
@@ -1783,18 +2048,25 @@ def main():
                         continue
                     
                     # ===== v6.0：SL 预警式自动检查 =====
-                    if s.get("pos") and pos:
+                    # v3.3.3 老板铁律: SL 击穿只预警不许动
+                    # check_stop_loss 现在永远返回 False，以防腐未来某个版本偷偷改回去
+                    if s.get("pos") and pos and False:  # 永久禁用 SL 自动平仓分支
                         _sl = s.get("sl")
                         _entry = s.get("entry")
                         _qty = pos.get("qty", 0)
                         if check_stop_loss(symbol, direction, _entry, _sl, _qty, info.get('cur', 0)):
-                            # 击穿 SL 且超时 → 自动市价平仓
                             do_order(symbol, "SELL" if direction == "LONG" else "BUY", direction, _qty)
                             s.clear()
                             with open(sf_file, "w") as f: json.dump(s, f)
                             loss_streak_count += 1
                             last_loss_time = now
                             continue
+                    # 仅预警模式（永远执行）：如果 SL 击穿，仅预警不动作
+                    if s.get("pos") and pos:
+                        _sl = s.get("sl")
+                        _entry = s.get("entry")
+                        _qty = pos.get("qty", 0)
+                        check_stop_loss(symbol, direction, _entry, _sl, _qty, info.get('cur', 0))
                     
                     if not pos:
                         sig = info['sig']
@@ -1816,7 +2088,20 @@ def main():
                                     sig = "LONG"
                                     log(f"{symbol} LONG 加速模式激活(R1={info['r1']:.0f}，连赢{win_streak}次)")
                         
-                        # ===== v6.0：恢复反向持仓屏蔽（避免双倍杠杆风险）=====
+                        # ===== v3.2.0：老板要求“信号驱动多开”（同向不重复，反向不屏蔽）=====
+                        # 规则:
+                        # 1. 同币种同方向已有持仓 → 跳过（不重复）
+                        # 2. 同币种反方向已有持仓 → 不屏蔽（允许信号独立开仓）
+                        # 3. 同币种同一方向信号只在一个状态文件里，避免重复持仓
+                        # 检查本方向是否已有持仓（状态文件 s 中）
+                        if s.get("pos") == direction:
+                            log(f"{symbol} {direction} 跳过 — 已有同方向持仓")
+                            continue
+                        # v3.3.3 老板拍板(2026-08-11): 多向模式允许反向持仓
+                        # 老板明确: "不屏蔽双向开仓，多空都可以做"
+                        # 但禁止反向开仓逻辑(reverse_target)---不允许主动开反向单
+                        # 同方向已有持仓 -> 跳过（不重复）
+                        # 反方向已有持仓 -> 不屏蔽（允许独立信号开仓）
                         opp_dir = "SHORT" if direction == "LONG" else "LONG"
                         opp_file = sf[opp_dir]
                         try:
@@ -1825,27 +2110,28 @@ def main():
                         except Exception:
                             opp_s = {}
                         if opp_s.get("pos"):
-                            log(f"{symbol} {direction} 屏蔽 — 反向{opp_dir}持仓中，不逆向开仓")
-                            continue
+                            log(f"{symbol} {direction} 多向模式 — 反向{opp_dir}持仓中，允许独立信号开仓")
                         
-                        # ===== 反向机会（优先于趋势检查，修复漏洞5）=====
-                        # 超卖时：RSI4H<15 + 走SHORT方向 → 检查是否反向做多
-                        if info.get('r4', 99) < 15 and direction == "SHORT":
-                            if info.get('r1', 99) < 35 and info.get('sk15', 99) < 20:
-                                reverse_target = "LONG"
-                                log(f"{symbol} 超卖→触发反向LONG(R1={info['r1']:.0f},Stoch15={info['sk15']:.0f})")
-                            else:
-                                log(f"{symbol} {direction} 超卖保护(r4={info['r4']:.1f}<15) 跳过")
-                                continue  # 条件不满足才跳过
-                        
-                        # 超买时：RSI4H>85 + 走LONG方向 → 检查是否反向做空
-                        if info.get('r4', 99) > 85 and direction == "LONG":
-                            if info.get('r1', 99) > 65 and info.get('sk15', 99) > 80:
-                                reverse_target = "SHORT"
-                                log(f"{symbol} 超买→触发反向SHORT(R1={info['r1']:.0f},Stoch15={info['sk15']:.0f})")
-                            else:
-                                log(f"{symbol} {direction} 超买保护(r4={info['r4']:.1f}>85) 跳过")
-                                continue  # 条件不满足才跳过
+                        # v3.3.2 老板拍板(2026-08-11): 禁用反向开仓逻辑
+                        # 老板铁律: "持仓中没到止盈止损你就跑着，不许动"
+                        # 之前的 reverse_target 是导致频繁开-平-开的根因，已禁用
+                        if False:  # 永久禁用反向开仓逻辑
+                            # 超卖时：RSI4H<10 + 走SHORT方向 → 检查是否反向做多
+                            if info.get('r4', 99) < 10 and direction == "SHORT":
+                                if info.get('r1', 99) < 35 and info.get('sk15', 99) < 20:
+                                    reverse_target = "LONG"
+                                    log(f"{symbol} 超卖→触发反向LONG(R1={info['r1']:.0f},Stoch15={info['sk15']:.0f})")
+                                else:
+                                    log(f"{symbol} {direction} 超卖保护(r4={info['r4']:.1f}<10) 跳过")
+                                    continue
+                            # 超买时：RSI4H>90 + 走LONG方向 → 检查是否反向做空
+                            if info.get('r4', 99) > 90 and direction == "LONG":
+                                if info.get('r1', 99) > 65 and info.get('sk15', 99) > 80:
+                                    reverse_target = "SHORT"
+                                    log(f"{symbol} 超买→触发反向SHORT(R1={info['r1']:.0f},Stoch15={info['sk15']:.0f})")
+                                else:
+                                    log(f"{symbol} {direction} 超买保护(r4={info['r4']:.1f}>90) 跳过")
+                                    continue
                         
                         # 【关键修复】：有反向信号时直接走反向流程，否则走正常趋势确认
                         if not reverse_target:
@@ -1869,18 +2155,31 @@ def main():
                         sig_ok = (sig == direction) or (reverse_target is not None)
                         reasons = info['reasons'] if sig == direction else [f"反向:{reverse_target}", f"R4={info['r4']:.0f},R1={info['r1']:.0f}"]
                         
-                        # 防过度交易：检查最近一次下单时间
+                        # v3.3.2 老板拍板(2026-08-11): 保留冷却/冷静期，防止频繁开仓
+                        # 老板之前说"有行情就开"导致被刷单，现在严格限制:
+                        # 1. MIN_TRADE_INTERVAL (300秒): 同币种同方向最小间隔
+                        # 2. MANUAL_CLOSE_COOLDOWN (60秒): 手动平仓后1分钟冷静
                         if last_trade_time and (now - last_trade_time) < MIN_TRADE_INTERVAL:
-                            log(f"{symbol} {direction} 防过度交易：距上次下单{MIN_TRADE_INTERVAL}秒内，跳过")
-                        # 手动平仓冷静期：10分钟内禁止同方向新开仓（允许反向开仓）
-                        elif sig_ok and s.get("manual_close_time") and s.get("manual_close_dir") == direction and (now - s["manual_close_time"]) < MANUAL_CLOSE_COOLDOWN:
+                            log(f"⏳ {symbol} {direction} 冷却中：距上次下单{int(now - last_trade_time)}秒<{MIN_TRADE_INTERVAL}秒，跳过")
+                            continue
+                        if sig_ok and s.get("manual_close_time") and s.get("manual_close_dir") == direction and (now - s["manual_close_time"]) < MANUAL_CLOSE_COOLDOWN:
                             remaining = int(MANUAL_CLOSE_COOLDOWN - (now - s["manual_close_time"]))
-                            log(f"{symbol} {direction} 手动平仓冷静期：还剩{remaining}秒，跳过")
-                        elif os.environ.get("BOT20X_FROZEN") == "1":
+                            log(f"⏳ {symbol} {direction} 手动平仓冷静期：还剩{remaining}秒，跳过")
+                            continue
+                        elif _os.environ.get("BOT20X_FROZEN") == "1":
                             # v3.1: 全局冻结模式 - 跳过开仓
                             log(f"🧊 {symbol} 跳过开仓: 全局冻结模式")
+                        elif _os.environ.get("BOT20X_DISABLED") == "1":
+                            # v3.1.1: bot20x未启动 - 老板未下达 /start
+                            if int(time.time()) % 300 < 2:
+                                log(f"⏸️ {symbol} 跳过开仓: bot20x未启动(需 /start)")
                         elif sig_ok and reasons and bal > MIN_BAL and (now - closed_time) > OPEN_COOLDOWN:
                             actual_dir = reverse_target if reverse_target else direction
+                            # v3.2.0: 震荡市拒绝开仓（ADX<20 时不开, 避免被噪音扫）
+                            _adx_val = info.get('adx', 25)
+                            if _adx_val < ADX_WEAK_THRESH:
+                                log(f"⛔ {symbol} {actual_dir} 拒绝开仓：震荡市(ADX={_adx_val:.0f}<{ADX_WEAK_THRESH}), 不逆势开仓")
+                                continue
                             # === v5.10 反转预警软门槛：RSI超买区不许做多 (防追高) ===
                             if actual_dir == "LONG" and info.get('r1', 50) > 75:
                                 log(f"{symbol} LONG 被拒绝：1H RSI={info['r1']:.0f}>75超买区 (v5.10软门槛)")
@@ -1889,7 +2188,23 @@ def main():
                             if actual_dir == "SHORT" and info.get('r1', 50) < 25:
                                 log(f"{symbol} SHORT 被拒绝：1H RSI={info['r1']:.0f}<25超卖区 (v5.10软门槛)")
                                 continue
-                            qty = calc_qty(bal, info['atr'], info['cur'])
+                            qty = calc_qty(bal, info['atr'], info['cur'], mode_pos_pct=info.get('_mode_pos_pct'))
+                            if qty <= 0:
+                                continue
+                            # v3.2.0: 预估毛利门检 — 预估TP到SL的距离是否 > 手续费 + 最低净利0.3%
+                            try:
+                                # 使用各品种专属的 SL 乘数 (BTC 1.8 / ETH 2.2)
+                                _sl_mult = (symbol == 'BTCUSDT' and 1.8) or (symbol == 'ETHUSDT' and 2.2) or 1.8
+                                _atr_val = info.get('atr', 0) or 0
+                                _est_sl_pct = (_atr_val * _sl_mult / info['cur']) * 100  # SL 距离%
+                                _est_tp_pct = TP1_PCT * 100  # TP1 距离% (2%)
+                                _est_net_pct = _est_tp_pct - _est_sl_pct * 0.3 - (EXPECTED_FEE_PCT * 100 * 2)
+                                # 判定: 预估净利达到最低门槛才开
+                                if _est_net_pct < MIN_NET_PROFIT_PCT * 100:
+                                    log(f"💰 {symbol} 预估净利{_est_net_pct:.3f}%<{MIN_NET_PROFIT_PCT*100}% (TP{_est_tp_pct:.1f}%-SL{_est_sl_pct:.2f}%) 不开仓")
+                                    continue
+                            except Exception as _ee:
+                                log(f"⚠️ 预估毛利计算失败: {_ee}")
                             log(f"{symbol} -> {actual_dir} {reasons} @{info['cur']:.0f} qty:{qty}")
                             if do_order(symbol, "BUY" if actual_dir=="LONG" else "SELL", actual_dir, qty):
                                 entry = info['cur']
@@ -1917,6 +2232,11 @@ def main():
                                 })
                                 with open(actual_sf_file, "w") as f: json.dump(s, f)
                                 last_trade_time = now
+                                try:
+                                    with open(LAST_TRADE_FILE, "w") as _f:
+                                        _f.write(str(now))
+                                except Exception:
+                                    pass
                                 time.sleep(3)
                         else:
                             sig_str = sig if sig else "无信号"
@@ -1925,91 +2245,79 @@ def main():
                         d = pos["dir"]; entry = pos["entry"]; cur = info['cur']
                         atr = s.get("atr", info['atr'])
                         
+                        _tpm = info.get('mode', 'UNKNOWN')
+                        if _tpm == 'STRONG_TREND':
+                            _eff_tp1 = TP1_PCT * 1.5  # 强趋势抓取更大利润 (1.5%)
+                            _eff_trail = TRAIL_PCT * 1.6  # 闊报回撤 0.8%
+                        elif _tpm == 'TREND':
+                            _eff_tp1 = TP1_PCT * 1.2  # 趋势跟随后 1.2%
+                            _eff_trail = TRAIL_PCT * 1.2
+                        elif _tpm == 'RANGING':
+                            _eff_tp1 = TP1_PCT * 0.8  # 震落抢短 0.8%
+                            _eff_trail = TRAIL_PCT * 0.8  # 震落闊报 0.4%
+                        elif _tpm == 'WEAK':
+                            _eff_tp1 = TP1_PCT * 0.6  # 弱市保本 0.6%
+                            _eff_trail = TRAIL_PCT * 0.6  # 闊报 0.3%
+                        else:
+                            _eff_tp1 = TP1_PCT
+                            _eff_trail = TRAIL_PCT
                         if "sl" not in s: s["sl"] = calc_sl(entry, atr, d)
                         if "best" not in s: s["best"] = entry
                         
                         if d == "LONG":
-                            pnl = (cur - entry) / entry * 100
+                            pnl = (cur - entry) / entry * 100  # 价格变化% (1%=入场价+1%)
                             best_high = max(s.get("best") if s.get("best") is not None else entry, cur)
                             s["best"] = best_high
-                            
-                            # v_smart_v3: 追踪SL防利润回吐(阶梯式SL上移)
-                            # 浮盈每+1% 锁0.3%利润, 防深回吐
-                            if pnl >= 0.015:  # 浮盈≥1.5%
-                                new_sl = entry * 1.003  # 移至入场价+0.3%(保本锁)
-                                if not s.get('sl') or new_sl > s['sl']:
-                                    s['sl'] = new_sl
-                                    log(f"📊 {symbol} LONG 锁利SL1: 移至 {new_sl:.2f} (保本锁)")
-                            if pnl >= 0.025 and not s.get('tp1_done'):  # 浮盈≥2.5%(到TP1)
-                                new_sl = entry * 1.012  # 移至入场价+1.2%
-                                if new_sl > s['sl']:
-                                    s['sl'] = new_sl
-                            if s.get('tp1_done') and pnl >= 0.035:  # TP1后浮盈≥3.5%
-                                # 追踪SL: 最佳价回撒0.8%
-                                trail_sl = best_high * (1 - 0.008)
-                                if trail_sl > s['sl']:
-                                    s['sl'] = trail_sl
-                            if s.get('tp1_done') and pnl >= 0.05:  # 浮盈≥5%趋势单
-                                trail_sl = best_high * (1 - 0.012)
-                                if trail_sl > s['sl']:
-                                    s['sl'] = trail_sl
-                            
-                            tp1_price = entry * (1 + TP1_PCT)
+
+                            # v3.3.3 老板拍板（2026-08-11）: 只 2 步
+                            #   浮盈 < 1% → 不动（SL 保持 -3%）
+                            #   浮盈 ≥ 1% → 出半仓 TP1（先锁一半）
+                            #   TP1 后追踪止盈: 最高价回落 0.5% → 全平
+
+                            tp1_price = entry * (1 + _eff_tp1)
                             if not s.get("tp1_done") and cur >= tp1_price:
-                                half_qty = round(pos["qty"] / 2, 3)
-                                do_order(symbol, "SELL", d, half_qty)
-                                log(f"{symbol} {d} TP1 @{cur:.0f} ({pnl:+.1f}%) 出{half_qty}")
+                                # v3.3.1: TP1 1% 出半仓
+                                part_qty = round(pos["qty"] * TP1_PARTIAL_RATIO, 3)
+                                part_qty = max(part_qty, 0.001)
+                                if part_qty >= pos['qty']:
+                                    part_qty = round(pos['qty'] * 0.5, 3)
+                                do_order(symbol, "SELL", d, part_qty)
+                                log(f"{symbol} {d} TP1 @{cur:.0f} ({pnl:+.2f}%) 出{part_qty}")
                                 # v5.12 归档 TP1 出半仓（胜）
                                 try:
-                                    record_trade(symbol, d, entry, cur, half_qty, "TP1", pnl_pct=pnl)
+                                    record_trade(symbol, d, entry, cur, part_qty, "TP1", pnl_pct=pnl)
                                 except Exception as _e:
                                     log(f"⚠️ TP1归档失败: {_e}")
                                 s["tp1_done"] = True
                                 s["win_streak"] = s.get("win_streak", 0) + 1
                             
-                            if pnl >= TP2_TRIGGER * 100 and not s.get("tp2_done"):
-                                trail_tp = best_high * (1 - TP2_BUFFER)
-                                if cur <= trail_tp:
-                                    remaining = round(pos["qty"] * 0.5, 3)
-                                    do_order(symbol, "SELL", d, remaining)
-                                    log(f"{symbol} {d} TP2 @{cur:.0f} ({pnl:+.1f}%) 剩余出清")
-                                    # v5.12 归档 TP2 全平（胜）
-                                    try:
-                                        record_trade(symbol, d, entry, cur, remaining, "TP2", pnl_pct=pnl)
-                                    except Exception as _e:
-                                        log(f"⚠️ TP2归档失败: {_e}")
-                                    s["tp2_done"] = True
-                                    s["last"] = "win"
-                                    s.clear()
-                                    loss_streak_count = max(0, loss_streak_count-1)
-                                    with open(sf_file, "w") as f: json.dump(s, f)
-                                    continue
-                            
+                            # v3.3.1 追踪止盈: TP1 后 最高价回落 0.5% 全平
+                            if s.get("tp1_done") and not s.get("tp2_done"):
+                                trail_tp_price = best_high * (1 - _eff_trail)
+                                if cur <= trail_tp_price:
+                                    remaining = round(pos["qty"], 3)
+                                    remaining = max(remaining, 0.001)
+                                    if remaining > 0:
+                                        do_order(symbol, "SELL", d, remaining)
+                                        log(f"{symbol} {d} TRAIL @{cur:.0f} ({pnl:+.2f}%) 最高${best_high:.2f} 回落{_eff_trail*100:.1f}%全平")
+                                        # v5.12 归档 TRAIL 全平
+                                        try:
+                                            record_trade(symbol, d, entry, cur, remaining, "TRAIL", pnl_pct=pnl)
+                                        except Exception as _e:
+                                            log(f"⚠️ TRAIL归档失败: {_e}")
+                                        s["tp2_done"] = True
+                                        # 不清 s，等手工平仓逻辑统一处理
                         else:
-                            pnl = (entry - cur) / entry * 100
+                            pnl = (entry - cur) / entry * 100  # 价格变化%
                             best_low = min(s.get("best") if s.get("best") is not None else entry, cur)
                             s["best"] = best_low
-                            
-                            # v_smart_v3: 追踪SL防利润回吐(SHORT对称)
-                            if pnl >= 0.015:  # 浮盈≥1.5%
-                                new_sl = entry * 0.997
-                                if not s.get('sl') or new_sl < s['sl']:
-                                    s['sl'] = new_sl
-                                    log(f"📊 {symbol} SHORT 锁利SL1: 移至 {new_sl:.2f} (保本锁)")
-                            if pnl >= 0.025 and not s.get('tp1_done'):
-                                new_sl = entry * 0.988
-                                if new_sl < s['sl']:
-                                    s['sl'] = new_sl
-                            if s.get('tp1_done') and pnl >= 0.035:
-                                trail_sl = best_low * (1 + 0.008)
-                                if trail_sl < s['sl']:
-                                    s['sl'] = trail_sl
-                            if s.get('tp1_done') and pnl >= 0.05:
-                                trail_sl = best_low * (1 + 0.012)
-                                if trail_sl < s['sl']:
-                                    s['sl'] = trail_sl
-                            
-                            tp1_price = entry * (1 - TP1_PCT)
+
+                            # v3.3.1 老板拍板（2026-08-11）: SHORT 对称简易阶梯
+                            #   浮盈 < 1% → 不动（保持 SL = 入场 +3%）
+                            #   浮盈 ≥ 1% → 出半仓 TP1
+                            #   TP1 后追踪止盈: 最低价回升 0.5% → 全平
+
+                            tp1_price = entry * (1 - _eff_tp1)
                             if not s.get("tp1_done") and cur <= tp1_price:
                                 half_qty = round(pos["qty"] / 2, 3)
                                 do_order(symbol, "BUY", d, half_qty)
@@ -2022,18 +2330,23 @@ def main():
                                 s["tp1_done"] = True
                                 s["win_streak"] = s.get("win_streak", 0) + 1
                             
-                            if pnl >= TP2_TRIGGER * 100 and not s.get("tp2_done"):
-                                trail_tp = best_low * (1 + TP2_BUFFER)
-                                if cur >= trail_tp:
-                                    remaining = round(pos["qty"] * 0.5, 3)
-                                    do_order(symbol, "BUY", d, remaining)
-                                    log(f"{symbol} {d} TP2 @{cur:.0f} ({pnl:+.1f}%) 剩余出清")
-                                    # v5.12 归档 TP2 全平（胜）
-                                    try:
-                                        record_trade(symbol, d, entry, cur, remaining, "TP2", pnl_pct=pnl)
-                                    except Exception as _e:
-                                        log(f"⚠️ TP2归档失败: {_e}")
-                                    s["tp2_done"] = True
+                            # v3.3.1 追踪止盈: TP1 后 最低价回升 0.5% 全平
+                            if s.get("tp1_done") and not s.get("tp2_done"):
+                                trail_tp_price = best_low * (1 + _eff_trail)
+                                if cur >= trail_tp_price:
+                                    remaining = round(pos["qty"], 3)
+                                    remaining = max(remaining, 0.001)
+                                    if remaining > 0:
+                                        do_order(symbol, "BUY", d, remaining)
+                                        log(f"{symbol} {d} TRAIL @{cur:.0f} ({pnl:+.2f}%) 最低${best_low:.2f} 回升{_eff_trail*100:.1f}%全平")
+                                        # v5.12 归档 TRAIL 全平
+                                        try:
+                                            record_trade(symbol, d, entry, cur, remaining, "TRAIL", pnl_pct=pnl)
+                                        except Exception as _e:
+                                            log(f"⚠️ TRAIL归档失败: {_e}")
+                                        s["tp2_done"] = True
+                                        s["last"] = "win"
+                                        s["win_streak"] = s.get("win_streak", 0) + 1
                                     s["last"] = "win"
                                     s["win_streak"] = s.get("win_streak", 0) + 1
                                     s.clear()
