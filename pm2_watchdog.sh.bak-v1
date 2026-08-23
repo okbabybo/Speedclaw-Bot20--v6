@@ -1,0 +1,7 @@
+#!/bin/bash
+# PM2 watchdog: 检查 PM2 表，空则 resurrect
+LOG=/root/.openclaw/workspace/pm2_resurrect.log
+if ! pm2 list 2>/dev/null | grep -q "bot20x\|bot-king"; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] PM2 empty, resurrecting" >> "$LOG"
+    pm2 resurrect >> "$LOG" 2>&1
+fi
