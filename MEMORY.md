@@ -505,3 +505,41 @@ P1-5: 实时检查异常必须打日志
 - 谁/什么触发了进程替换？可能是其他 agent 调用 `pm2 delete + pm2 start` 序列（chaos-* 的命名风格像子 agent）
 - 防护建议：dump.pm2 加只读、或者明确划 PM2 命名空间
 
+
+---
+
+## 问题记录（2026-08-24 07:50）
+
+### PM2 进程表被清空 → bot20x 失联
+- **症状**：07:49 老板查 bot 时发现 PM2 空，bot20x 没在跑
+- **根因**：07:47:39 PM2 daemon 收到 SIGTERM 被强杀（外部 agent/进程冲突），连同 dump.pm2 被清
+- **修复路径**：
+  1. `pm2 resurrect` 立即恢复两个 bot (PID 873397 bot-king, 873396 bot20x)
+  2. **pm2_watchdog.sh v2 三层守护部署**：
+     - 第1层：PM2 daemon ping，挂了拉起
+     - 第2层：进程表不完整（少 bot20x/bot-king），resurrect
+     - 第3层：进程状态非 online，pm2 restart
+  3. systemd timer pm2-resurrect-check 还在每30秒跑
+
+### bot20x v3.3.5：启动对账 + 手动平仓幽灵字段清理
+- **症状**：st_eth_long.json 残留 manual_close_time=1787528851 + entry=2440.08，但实际 LONG 已平
+- **根因**：`bot_20x.py:2219-2229` 手动平仓时只 pop("pos")，没 pop qty/entry/sl/best/atr/tp1_done/tp2_done
+- **修复**：
+  1. 两处手动平仓逻辑都加幽灵字段清理
+  2. **启动对账**：bot20x 启动时拿交易所实际持仓 vs 状态文件，不一致自动同步（状态文件有但实际无 → 清理；实际有但状态文件无 → 重建）
+- **commit**：fe6aeb2 v3.3.5: 启动对账+手动平仓幽灵字段清理 (PM2强杀后状态文件残留修复)
+
+### 其他
+- **bot20x 当前 ETH 真实持仓**：SHORT 0.162 @2455.21，浮亏 -$1.24
+- **st_eth_long.json 已清空**：LONG 7:47 手动平已确认
+- **st_eth_short.json 已对齐真实持仓**：pos/qty/entry 完整
+- **账户余额**：Total $98.55 / Available $77.37
+- **重启次数**：bot20x 当前 ↺=2 (历史累计)，uptime 16s 稳定
+- **git log**：fe6aeb2 (v3.3.5) + 4a91324 (watchdog v2)
+
+### 当前状态（08:00:36）
+- bot20x ✅ online (v3.3.5 启动对账生效)
+- bot-king ✅ online (3m uptime 稳定)
+- pm2-guard ✅ online (守护 PM2)
+- PM2 watchdog v2 ✅ 三层守护跑通 (07:57:39 / 07:58:49 / 08:00:36 全部 OK)
+- systemd pm2-resurrect-check timer ✅ 还在每30秒跑
