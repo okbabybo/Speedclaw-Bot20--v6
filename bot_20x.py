@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """20x杠杆 精准信号策略 v_smart_v3.3.4(2026-08-14 老板拍板不限笔数版)
+v_smart_v3.3.7 禁止bot持仓期反向开仓(2026-08-24 AI自审发现):
 v_smart_v3.3.6 manual持仓识别(2026-08-24 AI自审发现):
 v_smart_v3.3.5 启动对账+幽灵清理(2026-08-24 AI自审发现):
 v_smart_v3.3.4 老板拍板(2026-08-14 有条件就赚):
@@ -1979,7 +1980,7 @@ def calc_qty(balance, atr, price, mode_pos_pct=None):
 
 def main():
     log("="*60)
-    log("v_smart_v3.3.6 精准信号 | 20x固定 | 仓位≤10% | 阶梯追踪SL锁利 | 5档复利平滑 | 持仓期不主动平仓 | SL仅预警 | 不限笔数 | 启动对账 | manual屏障 | /start启动 /stop停止")
+    log("v3.3.7 精准信号 | 20x固定 | 仓位≤10% | 阶梯追踪SL锁利 | 5档复利平滑 | 持仓期不主动平仓 | SL仅预警 | 不限笔数 | manual屏障 | 反向开仓禁用 | /start启动 /stop停止")
     log("="*60)
 
     # === 修复 v3.2.1: 锁定 os/time 模块到本地变量,避免 UnboundLocalError ===
@@ -2369,11 +2370,11 @@ def main():
                         except Exception:
                             opp_s = {}
                         if opp_s.get("pos"):
-                            # v3.3.6 修复: 反向持仓如果是老板手动开的, bot 不动作
-                            if opp_s.get("source") == "manual":
-                                log(f"{symbol} {direction} 跳过 - 反向{opp_dir}是老板手动开的, bot 不动")
-                                continue
-                            log(f"{symbol} {direction} 多向模式 - 反向{opp_dir}持仓中,允许独立信号开仓")
+                            # v3.3.7 修复: 反向持仓不管是手动还是bot开的, 都禁止bot再开仓
+                            # 原因: 2026-08-24 11:00:33 bot 自己持仓时开了反向多单, 导致双重风险
+                            # 老板铁律: "别乱开多空单" "持仓期不主动平仓" 隐含禁止bot同币种开多个方向
+                            log(f"{symbol} {direction} 跳过 - 反向{opp_dir}已有持仓(qty={opp_s.get('qty')},源={opp_s.get('source','bot')}), bot 不叠仓")
+                            continue
 
                         # v3.3.2 老板拍板(2026-08-11): 禁用反向开仓逻辑
                         # 老板铁律: "持仓中没到止盈止损你就跑着,不许动"
