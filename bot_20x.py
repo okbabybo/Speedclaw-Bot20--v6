@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """20x杠杆 精准信号策略 v_smart_v3.3.4(2026-08-14 老板拍板不限笔数版)
+v_smart_v3.3.5 启动对账+幽灵清理(2026-08-24 AI自审发现):
 v_smart_v3.3.4 老板拍板(2026-08-14 有条件就赚):
   [1] 超卖保护: RSI4 < 15 → < 10 (避免错过暴跌强反弹)
   [2] 超买保护: RSI4 > 85 → > 90 (避免错过强趋势顶背离)
@@ -1246,6 +1247,40 @@ def startup_self_check():
         exit(1)
     log("自检全部通过")
 
+    # v3.3.5 启动对账:状态文件 vs 交易所实际持仓
+    # 2026-08-24 真实事件: PM2 被强杀重启后, 状态文件有 LONG manual_close 残留但实际无持仓
+    log("启动对账:状态文件 vs 交易所实际持仓...")
+    for sym in ("BTCUSDT", "ETHUSDT"):
+        try:
+            real_pos = get_all_positions(sym)
+            for d in ("LONG", "SHORT"):
+                sf = f"/root/.openclaw/workspace/st_{sym.lower().replace('usdt','')}_{d.lower()}.json"
+                try:
+                    with open(sf) as f: s = json.load(f)
+                except: s = {}
+                _has_state = bool(s.get("pos") and s.get("qty"))
+                _has_real = bool(real_pos.get(d))
+                if _has_state and not _has_real:
+                    log(f"⚠️ 启动对账告警: {sym} {d} 状态文件有持仓但交易所无, 清理幽灵")
+                    for _gkey in ("pos","qty","entry","sl","best","atr","tp1_done","tp2_done"):
+                        s.pop(_gkey, None)
+                    s["manual_close_time"] = time.time()
+                    s["manual_close_dir"] = d
+                    with open(sf, "w") as f: json.dump(s, f)
+                elif not _has_state and _has_real:
+                    log(f"⚠️ 启动对账告警: {sym} {d} 交易所持仓 {real_pos[d].get('qty')} 但状态文件无, 同步状态")
+                    s.update({
+                        "pos": d, "qty": real_pos[d]["qty"], "entry": real_pos[d]["entry"],
+                        "sl": real_pos[d]["entry"] * (1.05 if d=="LONG" else 0.95),
+                        "best": real_pos[d]["entry"], "atr": 0,
+                        "tp1_done": False, "tp2_done": False,
+                        "reconciliation": True, "reconciled_at": time.time(),
+                    })
+                    with open(sf, "w") as f: json.dump(s, f)
+        except Exception as _e:
+            log(f"⚠️ 启动对账 {sym} 异常: {_e}")
+    log("启动对账完成")
+
 def do_order(symbol, side, posSide, qty):
     # v3.2.0: 仓位为0直接跳过, 避免发空单报错
     if qty is None or qty <= 0:
@@ -1925,7 +1960,7 @@ def calc_qty(balance, atr, price, mode_pos_pct=None):
 
 def main():
     log("="*60)
-    log("v_smart_v3.3.4 精准信号 | 20x固定 | 仓位≤10% | 阶梯追踪SL锁利 | 5档复利平滑 | 持仓期不主动平仓 | SL仅预警 | 不限笔数 | /start启动 /stop停止")
+    log("v_smart_v3.3.5 精准信号 | 20x固定 | 仓位≤10% | 阶梯追踪SL锁利 | 5档复利平滑 | 持仓期不主动平仓 | SL仅预警 | 不限笔数 | 启动对账 | 幽灵清理 | /start启动 /stop停止")
     log("="*60)
 
     # === 修复 v3.2.1: 锁定 os/time 模块到本地变量,避免 UnboundLocalError ===
@@ -2203,6 +2238,9 @@ def main():
                             s["last"] = s.get("last", "closed")
                             s.pop("pos", None)
                             s.pop("qty", None)
+                            # v3.3.5 修复: 幽灵字段清理 (同样pop entry/sl/best/atr/tp1_done/tp2_done)
+                            for _gkey in ("entry", "sl", "best", "atr", "tp1_done", "tp2_done"):
+                                s.pop(_gkey, None)
                             with open(sf_file, "w") as f: json.dump(s, f)
                             continue
                         elif pos.get('qty', 0) < s.get('qty', 0) * 0.95:
@@ -2232,6 +2270,10 @@ def main():
                         s["manual_close_time"] = now  # 冷静期起点
                         s["last"] = s.get("last", "closed")
                         s.pop("pos", None)
+                        # v3.3.5 修复: 幽灵字段清理 - 手动平仓时同步清空qty/entry/sl/best等
+                        # 否则bot会读残留字段错乱(2026-08-24 真实事件: LONG manual_close_time残留)
+                        for _gkey in ("qty", "entry", "sl", "best", "atr", "tp1_done", "tp2_done"):
+                            s.pop(_gkey, None)
                         with open(sf_file, "w") as f: json.dump(s, f)
                         continue
 
