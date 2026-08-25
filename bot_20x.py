@@ -150,7 +150,7 @@ ENABLED_SYMBOLS = ['ETHUSDT']  # v3.2.0: 只跑 ETHUSDT (BTC 1H 波动太小, �
 # 20x杠杆下策略要稳 = SL必须用ATR(跟随波动)不用固定1%
 # TP/SL≥1.5:1 (BTC 1h波动0.32%, 1%止损每天被扫4-5次, 改成ATR×1.8=约0.9-1.2% SL)
 BTC_PARAMS = {
-    'sl_atr_mult': 1.8,      # v_smart_v2: 固定%→ATR×1.8, 跟随波动
+    'sl_atr_mult': 2.8,      # v3.7.3 老板拍板(2026-08-25 13:06): SL 从 ATR×1.8 放宽到 ATR×2.8, 防震荡/插针被扫
     'tp1_pct': 0.022,        # 2.2% TP1 (让TP跟SL同比例波动, 盈亏比1.5:1)
     'tp2_trigger': 0.038,    # 3.8%触发TP2
     'tp2_buffer': 0.012,
@@ -170,7 +170,7 @@ BTC_PARAMS = {
 # ETH 1h波动0.43% > BTC 0.32%, SL要更宽才能不被噪音扫掉
 # SL=ATR×2.2 约1.2-1.5%, TP=2.5% = 盈亏比≥1.7:1
 ETH_PARAMS = {
-    'sl_atr_mult': 2.2,      # v_smart_v2: 固定3.5%→ATR×2.2, 跟随波动但更宽
+    'sl_atr_mult': 3.5,      # v3.7.3 老板拍板(2026-08-25 13:06): SL 从 ATR×2.2 放宽到 ATR×3.5, 防震荡/插针被扫
     'tp1_pct': 0.025,        # 2.5% TP1 (维持, 让策略稳)
     'tp2_trigger': 0.045,
     'tp2_buffer': 0.015,
@@ -206,8 +206,8 @@ COUNTER_TREND_THRESH = 4.5     # 逆势信号独立门槛(v6.0新独立路径)
 SL_AUTO_ALERT_FILE = "/root/.openclaw/workspace/.sl_alert_pending"
 SL_AUTO_DELAY = 15              # v3.2.0优化: 预警后15秒老板未干预则自动平 (加快反应, 避免赗亏)
 SL_AUTO_ENABLED = True          # v3.3.4+ 老板拍板(2026-08-19): 全自动化平仓开启 - 软止损30秒缓冲+ATR动态止损+硬止损 -3% 兜底
-SL_SOFT_BUFFER_PCT = 0.005      # v3.3.4+: 软止损缓冲 -0.5%(软止损位 = 硬止损 - 0.5%)
-SL_OBSERVE_SECONDS = 30          # v3.3.4+: 软止损区观察 30 秒(防假突破扫出)
+SL_SOFT_BUFFER_PCT = 0.015     # v3.7.3 老板拍板(2026-08-25 13:06): 软止损缓冲 0.5%→1.5%, 宽软区防震荡被扫
+SL_OBSERVE_SECONDS = 90          # v3.7.3 老板拍板(2026-08-25 13:06): 观察期 30s→90s, 给趋势反弹更多时间
                                 # /hold命令可以取消本次自动平
                                 # SL不是动态调整而是动态计算(ATR跟随)
 
@@ -439,26 +439,28 @@ def record_trade(symbol, direction, entry, exit_price, qty, reason, pnl_pct=None
         return None
 
 def check_stop_loss(symbol, direction, entry, sl, qty, cur):
-    """v3.3.4+ 老板拍板(2026-08-19): 全自动化平仓
+    """v3.7.3 老板拍板(2026-08-25 12:56): SL 自动平仓 + 两阶段防插针
 
-    逻辑(两阶段):
-    1. 软止损区 (sl_soft = entry * (1 + SL_SOFT_BUFFER_PCT)):
+    逻辑:
+    1. 软止损区 (sl_soft = sl + 0.5% 缓冲):
        - 进入软止损区 → 启动 30 秒观察期 → 观察期内价格回升 → 取消
-       - 30秒内未回升 → 跳到阶段2
-    2. 硬止损 (sl_hard = entry * (1 - SL_PCT)):
+       - 30秒内未回升 → 触发平仓
+    2. 硬止损 (状态文件里的 sl，ATR动态计算):
        - 立即市价平仓,不可逆
 
     SL_AUTO_ENABLED=False 时退化为只预警不动作(老板TG可用 /enable_sl 开启)
     """
     if not sl or not entry or not qty:
         return False
-    # 计算硬止损 / 软止损位
+    # v3.7.3: 使用状态文件存的 sl(ATR动态)作硬止损, 加 0.5% 缓冲作软止损
+    # 软止损区 = 硬止损位 +0.5% (LONG) / -0.5% (SHORT)
+    # 这样软止损区间 = 0.5%, 进区不立刻平, 30秒还在才平
     if direction == "LONG":
-        sl_hard = entry * (1 - SL_PCT)
-        sl_soft = entry * (1 - SL_PCT + SL_SOFT_BUFFER_PCT)  # LONG: 软止损 = 硬止损位 + 0.5% 缓冲
+        sl_hard = sl  # 状态文件存的就是 ATR动态计算的硬止损
+        sl_soft = sl * (1 + SL_SOFT_BUFFER_PCT)  # 软止损 = 硬止损 + 0.5% 缓冲
     else:  # SHORT
-        sl_hard = entry * (1 + SL_PCT)
-        sl_soft = entry * (1 + SL_PCT - SL_SOFT_BUFFER_PCT)  # SHORT: 软止损 = 硬止损位 - 0.5% 缓冲
+        sl_hard = sl
+        sl_soft = sl * (1 - SL_SOFT_BUFFER_PCT)  # SHORT: 软止损 = 硬止损 - 0.5%
 
     # 未击穿 SL → False
     if direction == "LONG" and cur > sl_soft:
@@ -2001,7 +2003,7 @@ def calc_qty(balance, atr, price, mode_pos_pct=None):
 
 def main():
     log("="*60)
-    log("v3.7 精准信号 | 20x固定 | 仓位≤10% | 阶梯追踪SL锁利 | 5档复利平滑 | 持仓期不主动平仓 | SL仅预警 | 不限笔数 | manual屏障 | 多向持仓允许 | /start启动 /stop停止")
+    log("v3.7.3 精准信号 | 20x固定 | 仓位≤10% | 阶梯追踪SL锁利 | 5档复利平滑 | 持仓期不主动平仓 | SL两阶段防插针(软止损30s+硬止损-5%) | 不限笔数 | manual屏障 | 多向持仓允许 | /start启动 /stop停止")
     log("="*60)
 
     # === 修复 v3.2.1: 锁定 os/time 模块到本地变量,避免 UnboundLocalError ===
@@ -2324,26 +2326,24 @@ def main():
                         with open(sf_file, "w") as f: json.dump(s, f)
                         continue
 
-                    # ===== v6.0:SL 预警式自动检查 =====
-                    # v3.3.3 老板铁律: SL 击穿只预警不许动
-                    # check_stop_loss 现在永远返回 False,以防腐未来某个版本偷偷改回去
-                    if s.get("pos") and pos and False:  # 永久禁用 SL 自动平仓分支
-                        _sl = s.get("sl")
-                        _entry = s.get("entry")
-                        _qty = pos.get("qty", 0)
-                        if check_stop_loss(symbol, direction, _entry, _sl, _qty, info.get('cur', 0)):
-                            do_order(symbol, "SELL" if direction == "LONG" else "BUY", direction, _qty)
-                            s.clear()
-                            with open(sf_file, "w") as f: json.dump(s, f)
-                            loss_streak_count += 1
-                            last_loss_time = now
-                            continue
-                    # 仅预警模式(永远执行):如果 SL 击穿,仅预警不动作
+                    # ===== v6.0:SL 自动平仓（v3.7.3 老板2026-08-25 12:56 拍板：去掉锁死）=====
+                    # 老板原话："别锁死了，止损要灵活一点不要被插针和震荡被扫了"
+                    # 策略：check_stop_loss() 本身已实现两阶段（30秒软止损观察 + 硬止损立即平）
+                    # 软止损30秒缓冲防插针，进去软止损区不立刻平，30秒还在才平
+                    # 硬止损立即平仓
                     if s.get("pos") and pos:
                         _sl = s.get("sl")
                         _entry = s.get("entry")
                         _qty = pos.get("qty", 0)
-                        check_stop_loss(symbol, direction, _entry, _sl, _qty, info.get('cur', 0))
+                        _cur_price = info.get('cur', 0)
+                        if check_stop_loss(symbol, direction, _entry, _sl, _qty, _cur_price):
+                            log(f"⚡ SL 自动平仓触发: {symbol} {direction} qty={_qty}")
+                            if do_order(symbol, "SELL" if direction == "LONG" else "BUY", direction, _qty):
+                                s.clear()
+                                with open(sf_file, "w") as f: json.dump(s, f)
+                                loss_streak_count += 1
+                                last_loss_time = now
+                                continue
 
                     if not pos:
                         sig = info['sig']
