@@ -453,16 +453,20 @@ def check_stop_loss(symbol, direction, entry, sl, qty, cur):
     if not sl or not entry or not qty:
         return False
     # v3.7.3: 使用状态文件存的 sl(ATR动态)作硬止损, 加 0.5% 缓冲作软止损
-    # 软止损区 = 硬止损位 +0.5% (LONG) / -0.5% (SHORT)
-    # 这样软止损区间 = 0.5%, 进区不立刻平, 30秒还在才平
+    # v3.7.3 修正: 软止损位 = 硬止损位远离入场的一侧加缓冲
+    # LONG: sl 在 entry 下方, 软止损 = sl × (1 - buffer) 更下方(越亏越多才进软区)
+    # SHORT: sl 在 entry 上方, 软止损 = sl × (1 + buffer) 更上方(越赚越多才进软区)
+    # 这样软止损区间 = buffer% (进区不立刻平, 90秒还在才平)
     if direction == "LONG":
         sl_hard = sl  # 状态文件存的就是 ATR动态计算的硬止损
-        sl_soft = sl * (1 + SL_SOFT_BUFFER_PCT)  # 软止损 = 硬止损 + 0.5% 缓冲
+        sl_soft = sl * (1 - SL_SOFT_BUFFER_PCT)  # LONG: 软止损 = 硬止损下方 1.5% 缓冲
     else:  # SHORT
         sl_hard = sl
-        sl_soft = sl * (1 - SL_SOFT_BUFFER_PCT)  # SHORT: 软止损 = 硬止损 - 0.5%
+        sl_soft = sl * (1 + SL_SOFT_BUFFER_PCT)  # SHORT: 软止损 = 硬止损上方 1.5% 缓冲
 
-    # 未击穿 SL → False
+    # 未进软止损区 → False
+    # LONG: cur > sl_soft 表示价格高于软止损,未进区,不触发
+    # SHORT: cur < sl_soft 表示价格低于软止损,未进区,不触发
     if direction == "LONG" and cur > sl_soft:
         return False
     if direction == "SHORT" and cur < sl_soft:
@@ -1304,6 +1308,12 @@ def startup_self_check():
     log("启动对账完成")
 
 def do_order(symbol, side, posSide, qty):
+    # v3.7.4 老板拍板(2026-08-25 13:23): DRY_RUN 隔离模式
+    # 任何路径调 do_order 都会被这个全局检查拦住, 防止单元测试触发真下单
+    # 使用方式: DRY_RUN=1 python3 bot_20x.py 或 os.environ['DRY_RUN']='1'
+    if os.environ.get('DRY_RUN') == '1' or os.environ.get('BOT20X_DRY_RUN') == '1':
+        log(f"[DRY_RUN] {symbol} {side} {posSide} qty={qty} 跳过下单 (隔离模式开)")
+        return True  # 返回 True 让代码走完后续状态更新 (类似下单成功)
     # v3.2.0: 仓位为0直接跳过, 避免发空单报错
     if qty is None or qty <= 0:
         log(f"[跳过] {symbol} {side} {posSide} qty={qty} 为0, 不发送下单")
@@ -2178,13 +2188,28 @@ def main():
                 time.sleep(3); continue  # 减仓后跳过本次循环
 
             # === 复利风控:总仓位上限检查(按实际保证金算)===
-            # 总暴露 = Σ(持仓数量 × 当前价格 ÷ 杠杆) = 实际占用保证金
+            # v3.7.3 老板拍板(2026-08-25 13:18): manual 单不算进 bot 总仓位, 让 bot 按应有仓位自己下
+            # 总暴露 = Σ(bot 持仓数量 × 当前价格 ÷ 杠杆) = bot 实际占用保证金
+            # manual 单（老板手动开的）不计入，避免老板仓位影响 bot 下单空间
             total_exposure = 0
+            _dir_to_file = {
+                "LONG": f"st_{sym.lower().replace('usdt','')}_long.json",
+                "SHORT": f"st_{sym.lower().replace('usdt','')}_short.json",
+            } if False else {}  # 占位，下面按 sym 重计算
             for sym in ["BTCUSDT", "ETHUSDT"]:
                 try:
                     cur_price = float(get_klines(sym, "1m", 1)[0][4])
                 except:
                     cur_price = 0
+                # 预加载该 sym 的状态文件，判断 manual/bot
+                _sym_lower = sym.lower().replace('usdt','')
+                _state_l = json.load(open(f"st_{_sym_lower}_long.json")) if __import__('os').path.exists(f"st_{_sym_lower}_long.json") else {}
+                _state_s = json.load(open(f"st_{_sym_lower}_short.json")) if __import__('os').path.exists(f"st_{_sym_lower}_short.json") else {}
+                _manual_dirs = set()
+                if _state_l.get("source") == "manual" and _state_l.get("qty", 0) > 0:
+                    _manual_dirs.add("LONG")
+                if _state_s.get("source") == "manual" and _state_s.get("qty", 0) > 0:
+                    _manual_dirs.add("SHORT")
                 try:
                     pos_data = bn_get("/fapi/v2/positionRisk", f"symbol={sym}")
                     if isinstance(pos_data, list):
@@ -2192,9 +2217,16 @@ def main():
                             if not isinstance(p, dict): continue
                             amt = abs(float(p.get('positionAmt', 0)))
                             if amt > 0:
-                                entry = abs(float(p.get('entryPrice', 0)))
-                                price_used = cur_price if cur_price > 0 else entry
-                                total_exposure += (amt * price_used) / LEVER
+                                pos_side = p.get('positionSide', 'BOTH')  # 单向持仓为 BOTH
+                                # 判断是否 manual 单
+                                _is_manual = False
+                                if pos_side in ('LONG', 'SHORT'):
+                                    _is_manual = pos_side in _manual_dirs
+                                # bot 开的（或 hedge 模式下的 BOTH 不计入）：不计入总仓位检查
+                                if not _is_manual:
+                                    entry = abs(float(p.get('entryPrice', 0)))
+                                    price_used = cur_price if cur_price > 0 else entry
+                                    total_exposure += (amt * price_used) / LEVER
                 except Exception as e:
                     log(f"总仓位检查错误: {e}")
             if total_exposure > bal * MAX_TOTAL_EXPOSURE:
@@ -2331,19 +2363,24 @@ def main():
                     # 策略：check_stop_loss() 本身已实现两阶段（30秒软止损观察 + 硬止损立即平）
                     # 软止损30秒缓冲防插针，进去软止损区不立刻平，30秒还在才平
                     # 硬止损立即平仓
+                    # v3.7.4: manual屏障 - 老板手动开的单，bot永远不动（SL也不动）
                     if s.get("pos") and pos:
                         _sl = s.get("sl")
                         _entry = s.get("entry")
                         _qty = pos.get("qty", 0)
                         _cur_price = info.get('cur', 0)
                         if check_stop_loss(symbol, direction, _entry, _sl, _qty, _cur_price):
-                            log(f"⚡ SL 自动平仓触发: {symbol} {direction} qty={_qty}")
-                            if do_order(symbol, "SELL" if direction == "LONG" else "BUY", direction, _qty):
-                                s.clear()
-                                with open(sf_file, "w") as f: json.dump(s, f)
-                                loss_streak_count += 1
-                                last_loss_time = now
-                                continue
+                            # manual屏障：老板手动开的单不平
+                            if s.get("source") == "manual":
+                                log(f"🛡️ SL 触发但跳过：{symbol} {direction} source=manual, 老板手动单 bot 不动")
+                            else:
+                                log(f"⚡ SL 自动平仓触发: {symbol} {direction} qty={_qty}")
+                                if do_order(symbol, "SELL" if direction == "LONG" else "BUY", direction, _qty):
+                                    s.clear()
+                                    with open(sf_file, "w") as f: json.dump(s, f)
+                                    loss_streak_count += 1
+                                    last_loss_time = now
+                                    continue
 
                     if not pos:
                         sig = info['sig']
