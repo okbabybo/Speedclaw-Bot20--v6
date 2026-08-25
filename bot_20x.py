@@ -1706,7 +1706,28 @@ def get_signal(symbol):
         else:
             short_score += 0.5; short_reasons.append(f"阻力(${res1h_s:.0f},测{test_n_s}次)")
 
-    if short_score >= (_score_normal if not short_ready else _score_trending):
+    # v3.7.1 (2026-08-25 老板拍板): 信号矛盾仲裁 - 防止 LONG/SHORT 互相覆盖
+    # 场景: long_score 和 short_score 都过门槛时, 后跑的流程会覆盖前面的 sig
+    # bug: ETH 当前 R1=49/R4=63/R15=64 + sk15=0 → LONG 实际分高, 但 SHORT 流程后跑
+    #      SHORT 拿到 '顶背' + 'BB上轨84%' + 'V=1.7x' 凑够 7.5 分覆盖了 LONG
+    # 修复: 长短都过线时, 按"顺势优先 + 更高分优先"判定
+    if long_score >= (_score_normal if not STRONG_TREND_MODE else _score_trending) and \
+       short_score >= (_score_normal if not short_ready else _score_trending):
+        # 双信号都过线 → 信号矛盾
+        _diff = long_score - short_score
+        if abs(_diff) >= 2.0:
+            # 分差 ≥ 2.0: 取更高分方向 (明显更可信)
+            if long_score > short_score:
+                sig = "LONG"; reasons = long_reasons + [f"信号仲裁:分差{_diff:.1f}→LONG"]
+            else:
+                sig = "SHORT"; reasons = short_reasons + [f"信号仲裁:分差{-_diff:.1f}→SHORT"]
+        else:
+            # 分差 < 2.0: 顺势优先 (trend_up=True 取LONG)
+            if trend_up:
+                sig = "LONG"; reasons = long_reasons + [f"信号仲裁:矛盾分差{_diff:.1f}<2,顺势LONG"]
+            else:
+                sig = "SHORT"; reasons = short_reasons + [f"信号仲裁:矛盾分差{_diff:.1f}<2,顺势SHORT"]
+    elif short_score >= (_score_normal if not short_ready else _score_trending):
         sig = "SHORT"; reasons = short_reasons
     elif counter_trend_sig:
         sig = counter_trend_sig; reasons = counter_trend_reasons
