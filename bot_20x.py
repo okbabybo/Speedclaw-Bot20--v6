@@ -1082,16 +1082,16 @@ def detect_market_mode(klines_4h, klines_1h, atr_val):
     # 市场模式判定
     if adx_val >= 30 and ema_aligned:
         mode = 'STRONG_TREND'
-        hint = '趋势跟随优先, TP1 出半后追距放宽到 1.2%'
+        hint = '趋势跟随优先, 仓位 ≤ 5% (v3.9 紧缩)'  # v3.9: 仓位 10%→5%
     elif adx_val >= 25 and ema_aligned:
         mode = 'TREND'
-        hint = '趋势跟随 + 趋势反转预警'
+        hint = '趋势跟随 + 趋势反转预警, 仓位 ≤ 6% (v3.9)'
     elif adx_val >= 20:
         mode = 'RANGING'
-        hint = '反转策略为主, 信号门槛提至 5.5, SL 收紧至 ATR×1.8'
+        hint = '反转策略为主, 信号门槛提至 5.5, 仓位 ≤ 5% (v3.9)'
     else:
         mode = 'WEAK'
-        hint = '震落市, 信号门槛 6.0, 禁止逆势加仓, 严控仓位 ≤ 5%'
+        hint = '震落市, 信号门槛 6.0, 禁止逆势加仓, 严控仓位 ≤ 4% (v3.9)'
 
     # v3.3.4 老板拍板(2026-08-14): 精度提升 - 加EMA一致性权重
     # EMA矛盾 + ADX边界值 -> 降级处理,避免RANGING被误判为TREND
@@ -2283,16 +2283,19 @@ def main():
                         log(f"📊 {symbol} 市场模式: {mode_info['mode']} | ADX={mode_info['adx']:.1f} | EMA同向={mode_info['ema_aligned']} | {mode_info['strategy_hint']}")
                         globals()[_mode_key] = mode_info['mode']
                     # 震落市严格控仓: 仓位上限临时降低
+                    # v3.9 老板拍板(2026-08-27 09:19): 与 get_signal() 内的仓位上限对齐,避免覆盖
+                    # bug: get_signal() 设了 _mode_pos_pct, 这里又写一遍, 主循环的 v3.3.4 旧值覆盖了 v3.9 新值
+                    # 修复: 两边仓位上限必须一致 (STRONG=5%/TREND=6%/RANGING=5%/WEAK=4%)
                     if mode_info['mode'] == 'WEAK':
-                        info['_mode_pos_pct'] = 0.05  # 仓位上限临时降到 5%
+                        info['_mode_pos_pct'] = 0.04  # v3.9
                     elif mode_info['mode'] == 'RANGING':
-                        info['_mode_pos_pct'] = 0.07  # 震落反转到 7%
+                        info['_mode_pos_pct'] = 0.05  # v3.9
                     elif mode_info['mode'] == 'STRONG_TREND':
-                        info['_mode_pos_pct'] = 0.10  # 强趋势跟随后 10%
-                    else:
-                        info['_mode_pos_pct'] = 0.08  # 普通趋势 8%
+                        info['_mode_pos_pct'] = 0.05  # v3.9
+                    else:  # TREND
+                        info['_mode_pos_pct'] = 0.06  # v3.9
                 except Exception as _me:
-                    info['_mode_pos_pct'] = 0.10  # 默认
+                    info['_mode_pos_pct'] = 0.04  # 默认保守
                     pass
                 # v5.7 防御性字段处理 - 防止字段为None崩溃 (修复112次重启Bug)
                 for _k, _v in {'sig': None, 'long_ready': False, 'short_ready': False,
