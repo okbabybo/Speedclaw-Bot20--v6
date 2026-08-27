@@ -1440,16 +1440,16 @@ def get_signal(symbol):
         _mode_info = detect_market_mode(k4h, k1h, atr)
         if _mode_info['mode'] == 'STRONG_TREND':
             _score_normal = _score_trending  # 强趋势门槛放宽
-            _mode_pos_pct = 0.10
+            _mode_pos_pct = 0.05  # v3.9 老板拍板(2026-08-27 09:08): 仓位上限 10%→5%, 防 trend-following blow-up
         elif _mode_info['mode'] == 'TREND':
             _score_normal = min(_score_trending + 1.5, _score_normal)
-            _mode_pos_pct = 0.08
+            _mode_pos_pct = 0.06  # v3.9: TREND 仓位 8%→6%
         elif _mode_info['mode'] == 'RANGING':
             _score_normal = _score_normal + 0.5  # 震落略高门槛
-            _mode_pos_pct = 0.07
+            _mode_pos_pct = 0.05  # v3.9: RANGING 仓位 7%→5%
         else:  # WEAK
             _score_normal = _score_normal + 1.0  # 震落趋动门槛最高
-            _mode_pos_pct = 0.05
+            _mode_pos_pct = 0.04  # v3.9: WEAK 仓位 5%→4%
     except Exception:
         _mode_pos_pct = 0.10
 
@@ -1575,14 +1575,17 @@ def get_signal(symbol):
     # ===== 做多 =====
     long_score = 0; long_reasons = []
 
-    # 核心条件（强趋势模式：RSI<85即可；震荡模式：RSI<45）
-    long_rsi_thresh = 85 if STRONG_TREND_MODE else 45
+    # 核心条件（强趋势模式：RSI<70即可；震荡模式：RSI<45）
+    # v3.9 老板拍板(2026-08-27 09:08): 强趋势 RSI 阈值 85→70, 防趋势末期追高
+    # bug: ETH 从 $1850 涨到 $2493(+35%), 趋势跟随优先变成追高工具
+    long_rsi_thresh = 70 if STRONG_TREND_MODE else 45
     if r1 < 40: long_score += 1; long_reasons.append(f"R1={r1:.0f}<40")
     elif r1 < long_rsi_thresh: long_score += (1.0 if STRONG_TREND_MODE else 0.5); long_reasons.append(f"R1={r1:.0f}<{long_rsi_thresh}" + (" [趋势跟随]" if STRONG_TREND_MODE else ""))  # 强趋势模式RSI权重翻倍
-    # v3.3.4-fix4(2026-08-20): STRONG_TREND下RSI>85也加最佳分(反超买过滤只在震荡模式生效)
-    # bug: 今晚 ETH RSI1H=90 r4=93, 超过long_rsi_thresh=85, long_score拿不到RSI加分, sig=LONG达不到门槛
-    if STRONG_TREND_MODE and r1 >= 85 and r1 <= 95 and trend_up:
-        long_score += 1.0; long_reasons.append(f"R1={r1:.0f}∈[85,95] 趋势跟随+1")
+    # v3.9 老板拍板(2026-08-27 09:08): 删除 RSI 85-95 加分项(趋势末期追高)
+    # bug: ETH RSI=85-95 时加分 → 越接近超买分越高 → 趋势末期追高
+    # 修复: 不再加 RSI 85-95 的额外加分
+    # if STRONG_TREND_MODE and r1 >= 85 and r1 <= 95 and trend_up:
+    #     long_score += 1.0; long_reasons.append(f"R1={r1:.0f}∈[85,95] 趋势跟随+1")
     if r4 < 50: long_score += 1; long_reasons.append(f"R4={r4:.0f}<50")
     if r15 < 40: long_score += 1; long_reasons.append(f"R15={r15:.0f}<40")
     if trend_up: long_score += 2 if STRONG_TREND_MODE else 1; long_reasons.append("趋势↑" + (" [强趋势+2]" if STRONG_TREND_MODE else " [趋势+1]"))
@@ -2559,6 +2562,26 @@ def main():
                             # 同理:RSI超卖区<25不许做空 (防杀跌)
                             if actual_dir == "SHORT" and info.get('r1', 50) < 25 and not _strong_now:
                                 log(f"{symbol} SHORT 被拒绝:1H RSI={info['r1']:.0f}<25超卖区 (v5.10软门槛,震荡市)")
+                                continue
+                            # ===== v3.9 老板拍板(2026-08-27 09:10): 距 24h 高点回撤 < 1.5% 禁止开多 =====
+                            # bug: ETH 从 $1850 涨到 $2493(+35%),现价距 24h 高点 < 1% 时追高
+                            # 修复: 现价距 24h 高点回撤 < 1.5% → 拒绝开多(趋势末期防 FOMO)
+                            # 计算逻辑: 从 1h K 线拉 24 根, 取最高价作为 24h 高点
+                            if actual_dir == "LONG":
+                                try:
+                                    _k1h_24 = get_klines(symbol, "1h", 24)
+                                    _high_24h = max(float(k[2]) for k in _k1h_24) if _k1h_24 else info['cur']
+                                    _drawdown_from_high = (info['cur'] - _high_24h) / _high_24h * 100  # 负数=低于高点
+                                    if _drawdown_from_high > -1.5:  # 现价距高点回撤 < 1.5% (还没调整完)
+                                        log(f"⛔ {symbol} LONG 被拒绝:距24h高点回撤{_drawdown_from_high:.2f}%>-1.5%,防追高 FOMO")
+                                        continue
+                                except Exception as _e:
+                                    log(f"⚠️ 距高点回撤检测失败: {_e}")
+                            # ===== v3.9 老板拍板: STRONG_TREND RSI≥70 终极门檻 =====
+                            # 在 RSI 评分路径已经限制 70 的基础上, 主循环加一道双保险
+                            # 防止信号评分凑过门槛但 RSI 实际偏高
+                            if actual_dir == "LONG" and info.get('r1', 50) >= 70:
+                                log(f"⛔ {symbol} LONG 被拒绝:1H RSI={info['r1']:.0f}≥70 超买区, 趋势末期防追高 (v3.9)")
                                 continue
                             qty = calc_qty(bal, info['atr'], info['cur'], mode_pos_pct=info.get('_mode_pos_pct'))
                             if qty <= 0:
