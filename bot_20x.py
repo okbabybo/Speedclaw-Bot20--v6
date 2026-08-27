@@ -1606,6 +1606,21 @@ def get_signal(symbol):
     if bb_position < 0.2: long_score += 1.5; long_reasons.append(f"BB下轨={bb_position:.0%}")
     elif bb_position < 0.3: long_score += 1; long_reasons.append(f"BB偏低={bb_position:.0%}")
 
+    # ===== v3.8 老板拍板(2026-08-27 08:48): RSI 超买反向抑制 =====
+    # bug: ETH 涨 1.33% / RSI=60.3 时 bot 仍持续开多,24h 5笔追高,均价抬到 $2497
+    # 修复: STRONG_TREND 模式下,RSI 越接近超买区越要降权(防追高)
+    #   RSI 60-65: -0.5分(预警)
+    #   RSI 65-75: -1.5分(追高区)
+    #   RSI 75-85: -2.5分(严重追高)
+    #   RSI >85:   -3.5分(超买,基本别开)
+    # 注: 调低阈值到 60 是因为 ETH 在 STRONG_TREND 下 RSI=60 已经走完一波
+    if STRONG_TREND_MODE and r1 >= 60:
+        if r1 >= 85: long_score -= 3.5; long_reasons.append(f"⚠️RSI={r1:.0f}超买-3.5 [v3.8追高抑制]")
+        elif r1 >= 75: long_score -= 2.5; long_reasons.append(f"⚠️RSI={r1:.0f}严重追高-2.5 [v3.8追高抑制]")
+        elif r1 >= 65: long_score -= 1.5; long_reasons.append(f"⚠️RSI={r1:.0f}追高区-1.5 [v3.8追高抑制]")
+        else: long_score -= 0.5; long_reasons.append(f"⚠️RSI={r1:.0f}预警-0.5 [v3.8追高抑制]")
+    # 同向加仓保护:已在 main() 里加(价格差 ≥1.2% 才允许 bot 同向加仓)
+
     # ===== v5.9 trading-knowledge 集成:K线形态 + 信号K + 流动性猎杀 =====
     # K线形态识别 (15m 最新一根K线)
     pat_name, pat_score = detect_candle_pattern(k15m)
@@ -2378,6 +2393,8 @@ def main():
                                 if do_order(symbol, "SELL" if direction == "LONG" else "BUY", direction, _qty):
                                     s.clear()
                                     with open(sf_file, "w") as f: json.dump(s, f)
+                                    # v3.8 老板拍板(2026-08-27 08:52): SL 严仓后启动同向 30 分钟冷却,防刷单
+                                    globals()[f"_last_sl_close_{symbol}_{direction}"] = now
                                     loss_streak_count += 1
                                     last_loss_time = now
                                     continue
@@ -2414,6 +2431,16 @@ def main():
                                 log(f"{symbol} {direction} 跳过 - 本方向持仓是老板手动开的, bot 不动")
                                 continue
                             log(f"{symbol} {direction} 跳过 - 已有同方向持仓")
+                            continue
+                        # ===== v3.8 老板拍板(2026-08-27 08:52): bot 重复开仓冷却 =====
+                        # bug: 24h 内 bot 连续 5 笔 LONG,刷单问题
+                        # 根因: bot 止损平仓 → s.clear() → 状态文件清空 → 下个信号又开新仓
+                        # 修复: 同一方向被止损平仓后, 冷却 30 分钟禁止再开同方向(避免刷单)
+                        _cooldown_key = f"_last_sl_close_{symbol}_{direction}"
+                        _last_sl = globals().get(_cooldown_key, 0)
+                        if _last_sl and (now - _last_sl) < 1800:  # 30 分钟冷却
+                            remaining = int((1800 - (now - _last_sl)) / 60)
+                            log(f"⏳ {symbol} {direction} SL 后冷却中:还剩{remaining}分钟,跳过开仓(防刷单)")
                             continue
                         # v3.3.3 老板拍板(2026-08-11): 多向模式允许反向持仓
                         # 老板明确: "不屏蔽双向开仓,多空都可以做"
